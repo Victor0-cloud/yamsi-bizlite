@@ -51,3 +51,7 @@ def water_profit(data: dict):
 @app.post("/calculate/commission", dependencies=[Depends(require_api_key)])
 def commission_release(data: dict):
     return calculate(commission, data)
+
+@app.get("/amose", include_in_schema=False)
+def amose_public_page():
+    return FileResponse(ROOT / "amose.html")
