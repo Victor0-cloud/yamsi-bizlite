@@ -30,3 +30,9 @@ Expected callback ONLY after successful deployment:
 https://<actual-new-render-host>/webhooks/whatsapp
 Then copy verify token privately from Render configuration to Meta and Verify and save.
 Remote deployment, RLS integration test, sender identity, conversation flow and accounting posting are not yet complete.
+
+## Staging safety (read before any staging setup)
+Staging must use a separate Supabase project, a separate Render service, and a separate Meta test number. Never reuse production credentials or production URLs for staging.
+supabase/SETUP_NEW_PROJECT.sql must not be used for staging (it duplicates the 001 schema and seeds production directory names). Staging data is a minimal isolated fixture only.
+Approved public migration order for staging: 001, 002, 003, 004, 007, 008, 009, verified one at a time. Migrations 005 and 006 are intentionally private and excluded: do not restore, recreate, renumber, or publish them.
+render.yaml carries no environment values: SUPABASE_URL, SUPABASE_SECRET_KEY and WHATSAPP_APP_SECRET are entered privately per environment (sync: false). YAMSI_API_KEY and WHATSAPP_VERIFY_TOKEN are generated securely per service; copy the verify token privately from Render to Meta. WHATSAPP_ACCESS_TOKEN is never committed or generated here; it is supplied privately only when an explicitly approved send-test requires it.
