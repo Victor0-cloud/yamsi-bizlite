@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from supabase_backend import credentials, DatabaseUnavailable
 
@@ -86,8 +86,24 @@ async def save_events(rows):
     except (httpx.HTTPError, DatabaseUnavailable):
         raise HTTPException(503, "Inbox unavailable; retry delivery") from None
 
+async def _trigger_processing():
+    """Best-effort, fire-and-forget: runs strictly AFTER the durable inbox
+    insert has already succeeded, scheduled as a FastAPI background task so
+    it never delays or risks the webhook's response to Meta. Any failure
+    here (including Supabase being unreachable) is swallowed -- the row
+    stays at status='received' (or gets marked 'failed' with an error, see
+    message_processor.process_inbox_batch) and is picked up by a later
+    call, whether that's the next webhook delivery's background task or a
+    manual POST /internal/process-whatsapp-inbox. Nothing performed here can
+    ever cause a message to be lost or duplicated."""
+    from message_processor import process_inbox_batch
+    try:
+        await process_inbox_batch()
+    except Exception:
+        pass
+
 @router.post("/webhooks/whatsapp")
-async def receive(request: Request):
+async def receive(request: Request, background_tasks: BackgroundTasks):
     secret = os.environ.get("WHATSAPP_APP_SECRET", "")
     if not secret:
         raise HTTPException(503, "Webhook authenticity validation is not configured")
@@ -107,4 +123,7 @@ async def receive(request: Request):
         raise HTTPException(400, "Malformed webhook payload") from None
     if rows:
         await save_events(rows)
+        # Durable insertion above has already succeeded at this point; only
+        # now is any further (non-durable, best-effort) work scheduled.
+        background_tasks.add_task(_trigger_processing)
     return {"received":True,"events":len(rows)}

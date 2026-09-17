@@ -51,4 +51,49 @@ def read_businesses():
     except (httpx.HTTPError,ValueError,KeyError,TypeError):
         raise DatabaseUnavailable("Unable to read business records from Supabase.") from None
 
+def _headers(secret):
+    headers = {"apikey": secret}
+    if secret.startswith("eyJ"):
+        headers["Authorization"] = "Bearer " + secret
+    return headers
+
+async def rest_get(path, params=None):
+    """Shared async REST GET for Stage 007+ modules (task_engine, evidence_store,
+    rule_engine, owner_query). Raises DatabaseUnavailable on any non-200."""
+    url, secret = credentials()
+    try:
+        async with httpx.AsyncClient(base_url=url, headers=_headers(secret), timeout=8, follow_redirects=False) as client:
+            response = await client.get(path, params=params)
+    except httpx.HTTPError:
+        raise DatabaseUnavailable("Read failed for " + path) from None
+    if response.status_code != 200:
+        raise DatabaseUnavailable("Read failed for " + path)
+    return response.json()
+
+async def rest_post(path, rows, params=None, prefer="resolution=ignore-duplicates,return=minimal"):
+    url, secret = credentials()
+    headers = _headers(secret)
+    headers["Prefer"] = prefer
+    try:
+        async with httpx.AsyncClient(base_url=url, headers=headers, timeout=8, follow_redirects=False) as client:
+            response = await client.post(path, params=params, json=rows)
+    except httpx.HTTPError:
+        raise DatabaseUnavailable("Write failed for " + path) from None
+    if response.status_code not in (200, 201, 204):
+        raise DatabaseUnavailable("Write failed for " + path)
+    return response
+
+async def rest_patch(path, params, body, prefer="return=minimal"):
+    url, secret = credentials()
+    headers = _headers(secret)
+    headers["Prefer"] = prefer
+    try:
+        async with httpx.AsyncClient(base_url=url, headers=headers, timeout=8, follow_redirects=False) as client:
+            response = await client.patch(path, params=params, json=body)
+    except httpx.HTTPError:
+        raise DatabaseUnavailable("Update failed for " + path) from None
+    if response.status_code not in (200, 204):
+        raise DatabaseUnavailable("Update failed for " + path)
+    return response
+
 load_config()

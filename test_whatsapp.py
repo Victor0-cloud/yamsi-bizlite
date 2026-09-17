@@ -14,6 +14,12 @@ class WebhookTests(unittest.TestCase):
         self.env=patch.dict(os.environ,{"WHATSAPP_VERIFY_TOKEN":"test-verify","WHATSAPP_APP_SECRET":"test-secret"})
         self.env.start()
         self.addCleanup(self.env.stop)
+        # The background auto-processing trigger (Stage 007B) must never run
+        # for real during tests -- it would otherwise reach whatever
+        # Supabase project this machine's real .env / environment points to.
+        self.process_patch = patch("message_processor.process_inbox_batch", new_callable=AsyncMock)
+        self.process_patch.start()
+        self.addCleanup(self.process_patch.stop)
         self.client=TestClient(app)
         self.payload={"object":"whatsapp_business_account","entry":[{"changes":[{"field":"messages","value":{
             "metadata":{"phone_number_id":"test-account"},
