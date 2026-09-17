@@ -15,6 +15,6 @@ services:
       - key: WHATSAPP_APP_SECRET
         sync: false
       - key: SUPABASE_URL
-        value: https://hfxwdxxgsuzgysphtmsa.supabase.co
+        sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
