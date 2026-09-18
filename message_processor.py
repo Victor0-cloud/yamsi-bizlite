@@ -8,6 +8,15 @@ sale parsing everywhere else), evidence/task/mortality-incident creation
 via rule_engine.apply_rules(), and image-event handling via
 evidence_store.handle_incoming_image() -- image events are no longer
 discarded as "no text".
+
+Phase 4 wires the secure review loop into this batch without weakening
+any boundary: strict REVIEW CONFIRM / REVIEW REJECT commands in inbound
+text are handled through exactly one atomic review RPC each (sender
+identity, explicit authorization, and separation of duties enforced inside
+PostgreSQL; the reference -- never a UUID -- resolves the submission);
+fresh drafts of reviewable kinds trigger one idempotent review-request
+queue call. Ordinary reports still create drafts only. This module never
+posts operational data and never writes review tables directly.
 """
 import re
 import httpx
@@ -15,6 +24,7 @@ from supabase_backend import credentials, DatabaseUnavailable, TENANT
 import rule_engine
 import evidence_store
 import retry_engine
+import review_service
 
 INBOX_BATCH_LIMIT = 50
 
@@ -130,6 +140,33 @@ async def _process_one(client, row, summary):
         summary["unmatched"] += 1
         return
     tenant_id, employee_id = identities[0]["tenant_id"], identities[0]["employee_id"]
+
+    # Review-command isolation: any text claiming the reserved REVIEW
+    # CONFIRM / REVIEW REJECT namespace is a review-command attempt and
+    # must never flow into ordinary report ingestion. A strict command is
+    # handled through exactly one atomic RPC (scope, authorization, and
+    # separation of duties resolve inside the database from the reference
+    # plus this sender identity; reviewers routinely hold several
+    # assignments, so no assignment row is needed). Anything else under the
+    # reserved prefix -- UUID references, invalid references, missing
+    # KEY/REASON, unsupported syntax -- is refused explicitly with zero
+    # submissions, zero extraction, and zero writes. Casual words and
+    # ordinary reports never claim the prefix and fall through untouched.
+    command_text = None
+    if event.get("type") == "text":
+        candidate = (event.get("text") or {}).get("body")
+        if isinstance(candidate, str):
+            command_text = candidate
+    if review_service.is_reserved_command(command_text):
+        command = review_service.parse_review_command(command_text)
+        if command is not None:
+            await review_service.handle_review_command(
+                client, row, sender, command, summary)
+        else:
+            await review_service.refuse_malformed_command(
+                client, row, summary)
+        return
+
     assignments = await _get_json(client, "/rest/v1/biz_assignments",
         {"tenant_id": "eq." + tenant_id, "employee_id": "eq." + employee_id, "select": "business_id,branch_id"})
     candidates = _distinct_assignments(assignments)
@@ -164,6 +201,29 @@ async def _process_one(client, row, summary):
     if submission_id is not None:
         await rule_engine.apply_rules(tenant_id, business_id, branch_id, employee_id,
             submission_id, extraction, inbox_id=inbox_id)
+        # Human review loop: drafts of reviewable kinds get exactly one
+        # idempotent review-request queue call (reference issuance plus one
+        # WhatsApp request per eligible reviewer, all inside the RPC).
+        # Best-effort by design -- the draft already exists, so a queue
+        # failure must never break ingestion or lose the report; the same
+        # deterministic key re-queues it later without duplicates.
+        if extraction.get("kind") in review_service.REVIEWABLE_KINDS:
+            try:
+                queue_result = await review_service.queue_review_requests(
+                    client, submission_id, "queuereq:" + inbox_id)
+                queue_status = queue_result.get("status")
+                if queue_status == "queued":
+                    summary["review_requests_queued"] += 1
+                elif queue_status == "already_queued":
+                    summary["review_requests_already_queued"] += 1
+                elif queue_status == "no_eligible_reviewer":
+                    summary["review_requests_no_reviewer"] += 1
+                elif queue_status == "reviewer_unroutable":
+                    summary["review_requests_unroutable"] += 1
+                else:
+                    summary["review_requests_failed"] += 1
+            except Exception:
+                summary["review_requests_failed"] += 1
     await _mark_inbox(client, inbox_id, "processed")
     summary["submitted"] += 1
 
@@ -174,7 +234,11 @@ async def process_inbox_batch(limit=INBOX_BATCH_LIMIT):
     if key.startswith("eyJ"):
         headers["Authorization"] = "Bearer " + key
     summary = {"scanned": 0, "submitted": 0, "unmatched": 0, "skipped_non_message": 0,
-        "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0}
+        "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
+        "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
+        "review_requests_queued": 0, "review_requests_failed": 0,
+        "review_requests_already_queued": 0, "review_requests_no_reviewer": 0,
+        "review_requests_unroutable": 0}
     async with httpx.AsyncClient(base_url=url, headers=headers, timeout=8, follow_redirects=False) as client:
         inbox_rows = await _get_json(client, "/rest/v1/biz_message_inbox", {
             "status": "eq.received", "provider": "eq.whatsapp",
