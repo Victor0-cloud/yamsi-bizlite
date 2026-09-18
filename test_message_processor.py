@@ -9,6 +9,9 @@ from message_processor import parse_message, process_inbox_batch
 
 MESSAGE_EVENT = {"from": "+12025550123", "type": "text", "text": {"body": "Sold 50 bags at 500"}}
 
+SUBMISSION_UUID = "11111111-1111-1111-1111-111111111111"
+REVIEW_REF = "YR-ABCD234EFG"
+
 
 def inbox_row(row_id="inbox-1", event=None, kind="message"):
     return {"id": row_id, "provider": "whatsapp", "provider_account": "acct-1",
@@ -59,10 +62,19 @@ class ProcessInboxTests(unittest.TestCase):
             if path == "/rest/v1/biz_assignments":
                 return httpx.Response(200, json=assignments)
             if path == "/rest/v1/biz_submissions":
-                return httpx.Response(200, json=[{"id": "submission-1"}])
+                return httpx.Response(200, json=[{"id": SUBMISSION_UUID}])
             raise AssertionError("unexpected GET " + path)
+        async def fake_post(path, json=None, params=None, headers=None):
+            if path == "/rest/v1/rpc/amose_queue_review_requests":
+                return httpx.Response(200, json={"status": "queued",
+                    "review_ref": REVIEW_REF,
+                    "submission_id": json["p_submission_id"],
+                    "submission_kind": "sale",
+                    "request_key": json["p_request_key"],
+                    "notified": 1, "skipped": [], "is_retry": False})
+            return httpx.Response(post_status)
         client.get = AsyncMock(side_effect=fake_get)
-        client.post = AsyncMock(return_value=httpx.Response(post_status))
+        client.post = AsyncMock(side_effect=fake_post)
         client.patch = AsyncMock(return_value=httpx.Response(patch_status))
         return client
 
@@ -82,8 +94,13 @@ class ProcessInboxTests(unittest.TestCase):
             [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
             [{"business_id": "water", "branch_id": "warri"}])
         self.assertEqual(summary, {"scanned": 1, "submitted": 1, "unmatched": 0, "skipped_non_message": 0,
-            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0})
-        submitted = client.post.call_args.kwargs["json"][0]
+            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
+            "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
+            "review_requests_queued": 1, "review_requests_failed": 0,
+            "review_requests_already_queued": 0, "review_requests_no_reviewer": 0,
+            "review_requests_unroutable": 0})
+        submitted = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"][0].kwargs["json"][0]
         self.assertEqual(submitted["status"], "draft")
         self.assertEqual(submitted["tenant_id"], "tenant-1")
         self.assertEqual(submitted["business_id"], "water")
@@ -98,7 +115,11 @@ class ProcessInboxTests(unittest.TestCase):
     def test_unknown_sender(self):
         summary, client = self._run([inbox_row()], [], [])
         self.assertEqual(summary, {"scanned": 1, "submitted": 0, "unmatched": 1, "skipped_non_message": 0,
-            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0})
+            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
+            "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
+            "review_requests_queued": 0, "review_requests_failed": 0,
+            "review_requests_already_queued": 0, "review_requests_no_reviewer": 0,
+            "review_requests_unroutable": 0})
         client.post.assert_not_called()
         self.assertEqual(client.patch.call_args.kwargs["json"], {"status": "unmatched"})
 
@@ -110,7 +131,8 @@ class ProcessInboxTests(unittest.TestCase):
             [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
             [{"business_id": "water", "branch_id": "warri"}])
         self.assertEqual(summary["submitted"], 1)
-        submitted = client.post.call_args.kwargs["json"][0]
+        submitted = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"][0].kwargs["json"][0]
         self.assertIn("unit_price", submitted["payload"]["parsed"]["missing_fields"])
         self.assertEqual(submitted["status"], "draft")
 
@@ -134,13 +156,24 @@ class ProcessInboxTests(unittest.TestCase):
             [inbox_row()],
             [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
             [{"business_id": "water", "branch_id": "warri"}])
-        self.assertEqual(client.post.call_args.kwargs["params"]["on_conflict"], "inbox_id")
-        self.assertIn("ignore-duplicates", client.post.call_args.kwargs["headers"]["Prefer"])
+        submissions_calls = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"]
+        self.assertEqual(len(submissions_calls), 1)
+        self.assertEqual(submissions_calls[0].kwargs["params"]["on_conflict"], "inbox_id")
+        submissions_calls = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"]
+        self.assertEqual(len(submissions_calls), 1)
+        self.assertIn("ignore-duplicates",
+            submissions_calls[0].kwargs["headers"]["Prefer"])
         # A second run only ever considers rows still at status=received; once this
         # row is marked processed, a fresh scan returns nothing left to submit.
         summary2, client2 = self._run([], [], [])
         self.assertEqual(summary2, {"scanned": 0, "submitted": 0, "unmatched": 0, "skipped_non_message": 0,
-            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0})
+            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
+            "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
+            "review_requests_queued": 0, "review_requests_failed": 0,
+            "review_requests_already_queued": 0, "review_requests_no_reviewer": 0,
+            "review_requests_unroutable": 0})
         client2.post.assert_not_called()
 
     # 6. message for wrong/unmapped business (no assignment, and ambiguous assignment)
@@ -162,7 +195,11 @@ class ProcessInboxTests(unittest.TestCase):
         self.assertEqual(summary["unmatched"], 1)
         client.post.assert_not_called()
 
-    # 7. no accounting transaction created before approval
+    # 7. no accounting transaction created before approval: ingestion
+    # performs reads, one draft submission insert, one idempotent
+    # review-request queue RPC (reference issuance + reviewer
+    # notification, all inside the database), and inbox status writes --
+    # and nothing else. The draft stays a draft.
     def test_no_accounting_tables_touched(self):
         summary, client = self._run(
             [inbox_row()],
@@ -174,16 +211,34 @@ class ProcessInboxTests(unittest.TestCase):
         allowed = {"/rest/v1/biz_message_inbox", "/rest/v1/biz_sender_identities", "/rest/v1/biz_assignments",
             "/rest/v1/biz_submissions"}
         self.assertTrue(get_paths.issubset(allowed))
-        self.assertEqual(post_paths, {"/rest/v1/biz_submissions"})
+        self.assertEqual(post_paths, {"/rest/v1/biz_submissions",
+            "/rest/v1/rpc/amose_queue_review_requests"})
         self.assertEqual(patch_paths, {"/rest/v1/biz_message_inbox"})
-        submitted = client.post.call_args.kwargs["json"][0]
+        queue_calls = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/rpc/amose_queue_review_requests"]
+        self.assertEqual(len(queue_calls), 1)
+        queue_body = queue_calls[0].kwargs["json"]
+        self.assertEqual(set(queue_body), {"p_submission_id", "p_request_key"})
+        self.assertEqual(queue_body["p_submission_id"], SUBMISSION_UUID)
+        self.assertEqual(queue_body["p_request_key"], "queuereq:inbox-1")
+        for forbidden in ("tenant_id", "business_id", "branch_id",
+                "employee_id", "provider_account", "recipient"):
+            self.assertNotIn(forbidden, queue_body)
+        submitted = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"][0].kwargs["json"][0]
         self.assertEqual(submitted["status"], "draft")
+        self.assertEqual(summary["review_requests_queued"], 1)
+        self.assertEqual(summary["submitted"], 1)
 
     def test_status_event_is_acknowledged_without_submission(self):
         event = {"id": "wamid.1", "status": "delivered", "timestamp": "123"}
         summary, client = self._run([inbox_row(event=event, kind="status")], [], [])
         self.assertEqual(summary, {"scanned": 1, "submitted": 0, "unmatched": 0, "skipped_non_message": 1,
-            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0})
+            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
+            "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
+            "review_requests_queued": 0, "review_requests_failed": 0,
+            "review_requests_already_queued": 0, "review_requests_no_reviewer": 0,
+            "review_requests_unroutable": 0})
         client.post.assert_not_called()
         self.assertEqual(client.patch.call_args.kwargs["json"], {"status": "processed"})
 
