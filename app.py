@@ -12,6 +12,8 @@ from brain import answer_owner_question, load_reference_data
 app = FastAPI(title="YAMSI BizLite Brain", version="0.1.0")
 from whatsapp_webhook import router
 app.include_router(router)
+from telegram_webhook import router as telegram_router
+app.include_router(telegram_router)
 ROOT = Path(__file__).parent
 
 def require_api_key(x_yamsi_key: str = Header(default="")):
@@ -65,6 +67,41 @@ async def process_whatsapp_inbox():
         return await process_inbox_batch()
     except DatabaseUnavailable:
         raise HTTPException(503, "Inbox processing unavailable; check server configuration")
+
+@app.post("/internal/telegram-link", dependencies=[Depends(require_api_key)])
+async def telegram_link(data: dict):
+    """Issues one one-time Telegram link for an employee. The plaintext
+    token is returned exactly once in link_url for the owner to deliver;
+    it is never stored, logged, or returnable again."""
+    import telegram_adapter
+    try:
+        return await telegram_adapter.issue_employee_link(
+            data.get("tenant_id"), data.get("employee_id"),
+            data.get("request_key"))
+    except telegram_adapter.TelegramLinkError as error:
+        raise HTTPException(409, "Link issuance refused") from error
+    except telegram_adapter.TelegramAdapterError as error:
+        raise HTTPException(422, "Invalid link request") from error
+    except DatabaseUnavailable:
+        raise HTTPException(503, "Link issuance unavailable; check server configuration")
+
+@app.post("/internal/telegram-review-sync", dependencies=[Depends(require_api_key)])
+async def telegram_review_sync(data: dict):
+    """Queues Telegram review notifications for one draft submission and
+    dispatches its queued notifications. Best-effort backup-channel sync;
+    WhatsApp flow is never affected. Requires submission_id; request_key
+    defaults to a deterministic per-submission value."""
+    import telegram_adapter
+    submission_id = data.get("submission_id")
+    request_key = data.get("request_key") or ("tgsync:%s" % submission_id
+        if isinstance(submission_id, str) else "")
+    try:
+        return await telegram_adapter.sync_submission_reviews(
+            submission_id, request_key)
+    except telegram_adapter.TelegramAdapterError:
+        raise HTTPException(422, "Invalid sync request")
+    except DatabaseUnavailable:
+        raise HTTPException(503, "Telegram sync unavailable; check server configuration")
 
 @app.post("/internal/owner-query", dependencies=[Depends(require_api_key)])
 async def owner_query_endpoint(data: dict):
