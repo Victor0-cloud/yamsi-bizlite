@@ -95,6 +95,15 @@ HELP_LINKED = (
     "[CORRECTION <reason>], or "
     "REVIEW REJECT <reference> KEY <key> REASON <reason>.")
 
+HELP_LINKED_ORDINARY = (
+    "YAMSI review backup: this Telegram account is linked. "
+    "This bot accepts review requests and REVIEW commands only -- it does "
+    "not take sales, stock, production, or expense reports. "
+    "Approve with the Approve button, or reply "
+    "REVIEW CONFIRM <reference> KEY <key> "
+    "[CORRECTION <reason>], or "
+    "REVIEW REJECT <reference> KEY <key> REASON <reason>.")
+
 REJECT_INSTRUCTIONS = (
     "To reject, reply with: REVIEW REJECT {ref} KEY {key} REASON <reason>. "
     "The reason is required and is recorded with the rejection.")
@@ -541,14 +550,59 @@ async def _send_best_effort(summary, chat_id, text, key,
     return True
 
 
+async def _is_linked_sender(client, sender):
+    """Returns True when the numeric Telegram sender already has a
+    biz_sender_identities row for provider='telegram'. Only the numeric
+    sender id is ever bound -- display names, usernames, phone numbers,
+    and any tenant/employee/scope values from the message are ignored.
+    Transport, status, and payload failures raise WorkflowDatabaseError
+    (fail closed) without embedding secrets or identifiers."""
+    clean_sender = _require_sender_id(sender)
+    try:
+        response = await client.get("/rest/v1/biz_sender_identities",
+            params={"provider": "eq." + PROVIDER,
+                "provider_sender": "eq." + clean_sender,
+                "select": "employee_id", "limit": "1"})
+    except httpx.HTTPError:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity") from None
+    if response.status_code != 200:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity")
+    try:
+        rows = response.json()
+    except ValueError:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity") from None
+    if not isinstance(rows, list):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity")
+    return len(rows) > 0
+
+
+async def _send_identity_help(client, inbox_id, sender, chat_id, summary):
+    """Sends the ordinary-message help reply matching the stored Telegram
+    identity: linked reviewers hear review-only scope, genuinely unlinked
+    senders hear the linking instructions. Creates no submissions and
+    adds no intake of any kind. Database failures propagate (fail closed)
+    with no reply and no identifiers exposed."""
+    if await _is_linked_sender(client, sender):
+        await _send_best_effort(summary, chat_id, HELP_LINKED_ORDINARY,
+            "help_sent")
+    else:
+        await _send_best_effort(summary, chat_id, HELP_UNLINKED, "help_sent")
+    await _set_inbox_status(client, inbox_id, "processed")
+    summary["unmatched"] += 1
+    return {"outcome": "help"}
+
+
 async def _process_message(client, inbox_id, message, summary):
     sender = message_sender(message)
     chat_id = message_chat_id(message)
     text = message_text(message)
     if text is None:
-        await _send_best_effort(summary, chat_id, HELP_UNLINKED, "help_sent")
-        await _set_inbox_status(client, inbox_id, "processed")
-        return {"outcome": "help"}
+        return await _send_identity_help(
+            client, inbox_id, sender, chat_id, summary)
 
     # Secure one-time link presentation. An invalid-shape token is a
     # terminal refusal (help reply, row consumed), never a stuck row.
@@ -616,10 +670,8 @@ async def _process_message(client, inbox_id, message, summary):
             "help_sent")
         return {"outcome": "refused", "error": "RefusedReviewCommand"}
 
-    await _send_best_effort(summary, chat_id, HELP_UNLINKED, "help_sent")
-    await _set_inbox_status(client, inbox_id, "processed")
-    summary["unmatched"] += 1
-    return {"outcome": "help"}
+    return await _send_identity_help(
+        client, inbox_id, sender, chat_id, summary)
 
 
 async def _process_callback(client, inbox_id, callback_query, summary):

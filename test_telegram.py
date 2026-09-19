@@ -35,10 +35,12 @@ TENANT_UUID = "00000000-0000-0000-0000-000000000001"
 EMP_UUID = "22222222-2222-2222-2222-222222222222"
 
 
-def message_update(update_id=100, text="hello", chat_id=CHAT_ID):
+def message_update(update_id=100, text="hello", chat_id=CHAT_ID,
+        sender_id=None):
+    sender = int(sender_id if sender_id is not None else chat_id)
     return {"update_id": update_id,
         "message": {"message_id": 1,
-            "from": {"id": int(chat_id), "first_name": "Attacker Chosen Name",
+            "from": {"id": sender, "first_name": "Attacker Chosen Name",
                 "username": "spoofed_name"},
             "chat": {"id": int(chat_id), "type": "private"},
             "text": text}}
@@ -439,10 +441,21 @@ class CallbackRpcTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
-    async def _run_message(self, text, consume=None, command=None):
+    async def _run_message(self, text, consume=None, command=None,
+            identity_rows=(), identity_failure=None, chat_id=CHAT_ID,
+            sender_id=None):
         client = mock_batch_client()
+        if identity_failure == "transport":
+            client.get = AsyncMock(side_effect=httpx.HTTPError("db down"))
+        elif identity_failure == "status":
+            client.get = AsyncMock(
+                return_value=httpx.Response(500, json={"message": "down"}))
+        else:
+            client.get = AsyncMock(return_value=httpx.Response(
+                200, json=list(identity_rows)))
         summary = tg._new_summary()
-        update = tg.parse_update(message_update(text=text))
+        update = tg.parse_update(message_update(
+            text=text, chat_id=chat_id, sender_id=sender_id))
         with patch.object(tg, "credentials",
                 return_value=("https://example.supabase.co", "test-key")), \
              patch.object(tg.httpx, "AsyncClient") as factory, \
@@ -542,6 +555,122 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
             [c for c in client.post.call_args_list
                 if c.args[0] == "/rest/v1/biz_submissions"], [])
         self.assertEqual(summary["unmatched"], 1)
+
+    async def test_ordinary_text_linked_sender_gets_review_only_reply(self):
+        outcome, summary, client, _, command_mock, send_mock = \
+            await self._run_message("hello",
+                identity_rows=[{"employee_id": EMP_UUID}])
+        command_mock.assert_not_called()
+        self.assertEqual(
+            [c for c in client.post.call_args_list
+                if c.args[0] == "/rest/v1/biz_submissions"], [])
+        self.assertEqual(outcome["outcome"], "help")
+        reply = send_mock.call_args.args[1]
+        self.assertIn("linked", reply.lower())
+        self.assertNotIn("not linked", reply.lower())
+        self.assertIn("REVIEW", reply)
+        self.assertIn("does not take sales", reply)
+        params = client.get.call_args.kwargs["params"]
+        self.assertEqual(params, {"provider": "eq.telegram",
+            "provider_sender": "eq." + CHAT_ID,
+            "select": "employee_id", "limit": "1"})
+        self.assertEqual(
+            client.patch.call_args.kwargs["json"], {"status": "processed"})
+        self.assertEqual(summary["unmatched"], 1)
+
+    async def test_ordinary_text_unlinked_sender_keeps_linking_help(self):
+        outcome, summary, _, _, command_mock, send_mock = \
+            await self._run_message("hello")
+        command_mock.assert_not_called()
+        self.assertEqual(outcome["outcome"], "help")
+        reply = send_mock.call_args.args[1]
+        self.assertIn("not linked", reply.lower())
+        self.assertEqual(summary["unmatched"], 1)
+
+    async def test_identity_uses_user_id_not_chat_id(self):
+        # Linked from.id with a different chat.id: still recognized as
+        # linked (identity binds the user id at link time), while the
+        # reply is routed to the chat the message came from.
+        outcome, summary, client, _, _, send_mock = \
+            await self._run_message("hello",
+                identity_rows=[{"employee_id": EMP_UUID}],
+                chat_id="999888777", sender_id=CHAT_ID)
+        self.assertEqual(outcome["outcome"], "help")
+        reply = send_mock.call_args.args[1]
+        self.assertNotIn("not linked", reply.lower())
+        params = client.get.call_args.kwargs["params"]
+        self.assertEqual(params["provider_sender"], "eq." + CHAT_ID)
+        self.assertEqual(send_mock.call_args.args[0], "999888777")
+        self.assertEqual(summary["unmatched"], 1)
+
+    async def test_chat_id_alone_never_links_unlinked_sender(self):
+        # Unlinked from.id with an unrelated chat.id: the chat id is
+        # never consulted for identity, so the sender stays unlinked.
+        outcome, summary, client, _, _, send_mock = \
+            await self._run_message("hello", chat_id="999888777",
+                sender_id="111222333")
+        self.assertEqual(outcome["outcome"], "help")
+        reply = send_mock.call_args.args[1]
+        self.assertIn("not linked", reply.lower())
+        params = client.get.call_args.kwargs["params"]
+        self.assertEqual(params["provider_sender"], "eq.111222333")
+        self.assertEqual(summary["unmatched"], 1)
+
+    async def test_help_reply_leaks_no_cross_tenant_identifiers(self):
+        # Whatever tenant the linked row belongs to, the help reply
+        # exposes no tenant/employee/sender identifiers and the lookup
+        # carries no tenant scope that could reach another tenant's data.
+        outcome, summary, client, _, _, send_mock = \
+            await self._run_message("hello",
+                identity_rows=[{"employee_id": EMP_UUID}])
+        self.assertEqual(outcome["outcome"], "help")
+        reply = send_mock.call_args.args[1]
+        self.assertNotIn(TENANT_UUID, reply)
+        self.assertNotIn(EMP_UUID, reply)
+        self.assertNotIn(CHAT_ID, reply)
+        params = client.get.call_args.kwargs["params"]
+        self.assertNotIn("tenant", " ".join(params.keys()))
+
+    async def test_ordinary_text_identity_lookup_failure_fails_closed(self):
+        client = mock_batch_client()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("db down"))
+        summary = tg._new_summary()
+        update = tg.parse_update(message_update(text="hello"))
+        with patch.object(tg, "credentials",
+                return_value=("https://example.supabase.co", "test-key")), \
+             patch.object(tg.httpx, "AsyncClient") as factory, \
+             patch.object(outbound_telegram_module, "send_message",
+                new_callable=AsyncMock) as send_mock:
+            factory.return_value.__aenter__.return_value = client
+            outcome = await tg.process_stored_update(
+                update, "inbox-7", summary)
+        self.assertEqual(outcome["outcome"], "failed")
+        self.assertEqual(outcome["error"], "WorkflowDatabaseError")
+        self.assertEqual(summary["failed"], 1)
+        send_mock.assert_not_called()
+        note = client.patch.call_args.kwargs["json"]
+        self.assertEqual(note["status"], "failed")
+        self.assertNotIn(CHAT_ID, note.get("processing_error", ""))
+        self.assertNotIn("7551230024", note.get("processing_error", ""))
+
+    async def test_start_path_never_queries_sender_identities(self):
+        outcome, summary, client, _, _, send_mock = \
+            await self._run_message("/start")
+        client.get.assert_not_called()
+        self.assertEqual(outcome["outcome"], "help")
+        send_mock.assert_called_once()
+
+    async def test_review_command_path_never_queries_sender_identities(self):
+        async def fake_command(client, row, sender, command, summary):
+            summary["reviews_confirmed"] += 1
+            return {"outcome": "confirm", "result": {}}
+
+        text = "REVIEW CONFIRM %s KEY k1" % REF
+        outcome, summary, client, _, _, send_mock = \
+            await self._run_message(text, command=fake_command)
+        client.get.assert_not_called()
+        self.assertEqual(outcome["outcome"], "confirm")
+        send_mock.assert_called_once()
 
     async def test_start_invalid_shape_token_refused_not_stuck(self):
         outcome, summary, client, _, _, send_mock = \
