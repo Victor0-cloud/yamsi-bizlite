@@ -35,6 +35,7 @@ from operational_posting import (
 )
 
 SUBMISSION_ID = "11111111-1111-1111-1111-111111111111"
+OPERATOR_ID = "44444444-4444-4444-4444-444444444444"
 FROM_ID = "22222222-2222-2222-2222-222222222222"
 TO_ID = "33333333-3333-3333-3333-333333333333"
 REVIEW_REF = "YR-ABCD234EFG"
@@ -397,6 +398,88 @@ class VerifiedValidationTests(unittest.TestCase):
             human_confirmation._classify_rpc_error(
                 "SCOPE: handover giver x is not assigned"),
             ScopeMismatchError)
+        self.assertIsInstance(
+            human_confirmation._classify_rpc_error(
+                "APPROVAL: destination account X is not approved"),
+            human_confirmation.ApprovalRequiredError)
+        self.assertIsInstance(
+            operational_posting._classify_rpc_error(
+                "APPROVAL: no approved bank deposit accounts are configured"),
+            operational_posting.ApprovalRequiredError)
+
+
+# ---------------------------------------------------------------------------
+# 6b. Approved destination accounts: the deposit posting migration gate.
+# These assert the migration's authoritative contract statically (the live
+# behavior is additionally proven by supabase/probes/
+# daily_business_records_probes.sql against the local shadow database):
+# approved accounts succeed; everything else fails closed.
+# ---------------------------------------------------------------------------
+
+class ApprovedAccountGateTests(unittest.TestCase):
+    @classmethod
+    def _migration(cls):
+        if not hasattr(cls, "_cached"):
+            with open("supabase/migrations/"
+                    "20260920000000_daily_business_records.sql",
+                    encoding="utf-8") as handle:
+                cls._cached = handle.read()
+        return cls._cached
+
+    def _posting_body(self):
+        text = self._migration()
+        start = text.index(
+            "create or replace function public.amose_post_bank_deposit(")
+        end = text.index("\n$func$;", start)
+        return text[start:end]
+
+    def test_setting_key_and_scope(self):
+        body = self._posting_body()
+        self.assertIn("approved_bank_deposit_accounts", body)
+        self.assertIn("public.biz_setting_versions", body)
+        self.assertIn("s.tenant_id = v_tenant", body)
+        self.assertIn("s.business_id = v_business", body)
+        self.assertIn("s.branch_id = v_branch", body)
+        self.assertIn("order by s.effective_from desc", body)
+
+    def test_missing_or_malformed_setting_fails_closed(self):
+        body = self._posting_body()
+        self.assertIn(
+            "APPROVAL: no approved bank deposit accounts are configured",
+            body)
+        # Malformed shapes (non-object, missing/empty accounts array)
+        # take the same fail-closed path as an absent setting.
+        self.assertIn("jsonb_typeof(v_setting) <> 'object'", body)
+        self.assertIn("jsonb_typeof(v_setting -> 'accounts') <> 'array'",
+            body)
+        self.assertIn(
+            "jsonb_array_length(v_setting -> 'accounts') < 1", body)
+
+    def test_unapproved_account_fails_closed(self):
+        body = self._posting_body()
+        self.assertIn(
+            "APPROVAL: destination account % is not an approved bank "
+            "deposit account",
+            body)
+
+    def test_matching_is_case_and_whitespace_safe(self):
+        body = self._posting_body()
+        self.assertIn(
+            "btrim(lower(v_acct ->> 'name')) = btrim(lower(v_dest))", body)
+
+    def test_canonical_account_value_preserved(self):
+        body = self._posting_body()
+        self.assertIn("v_canonical_dest := btrim(v_acct ->> 'name')", body)
+        self.assertIn("v_dest := v_canonical_dest;", body)
+
+    def test_duplicate_comparison_is_normalized(self):
+        body = self._posting_body()
+        self.assertIn(
+            "btrim(lower(c.destination_account)) = btrim(lower(v_dest))",
+            body)
+        self.assertIn(
+            "btrim(lower(c.deposit_reference)) = btrim(lower(v_ref))",
+            body)
 
 
 # ---------------------------------------------------------------------------
@@ -428,36 +511,159 @@ class OperatorPayTests(unittest.TestCase):
         preview = operator_pay.preview_operator_pay(0, 5000)
         self.assertEqual(preview["amount_kobo"], 0)
 
-    def test_scope_preview_without_setting(self):
+    def _work_client(self, runs, setting, seen):
         async def fake_get(path, params=None):
-            self.assertIn("biz_setting_versions", path)
-            return []
+            seen.append((path, dict(params or {})))
+            if "biz_employees" in path:
+                return [{"id": OPERATOR_ID, "active": True}]
+            if "biz_assignments" in path:
+                return [{"business_id": "amose_table_water"}]
+            if "biz_production_runs" in path:
+                return runs
+            if "biz_setting_versions" in path:
+                return setting
+            raise AssertionError("unexpected GET " + path)
 
+        return fake_get
+
+    def test_work_preview_totals_confirmed_good_bags(self):
+        seen = []
+        fake_get = self._work_client(
+            [{"good_quantity": 200}, {"good_quantity": 50}],
+            [{"value": {"amount_kobo": 5000}}], seen)
         with patch("operator_pay.rest_get", side_effect=fake_get):
             preview = asyncio.run(
-                operator_pay.preview_operator_pay_for_scope(
-                    "tenant-1", "water", "asaba", 250))
-        self.assertEqual(preview["status"], "rate_not_configured")
-
-    def test_scope_preview_with_setting(self):
-        async def fake_get(path, params=None):
-            return [{"value": {"amount_kobo": 5000}}]
-
-        with patch("operator_pay.rest_get", side_effect=fake_get):
-            preview = asyncio.run(
-                operator_pay.preview_operator_pay_for_scope(
-                    "tenant-1", "water", "asaba", 250))
+                operator_pay.preview_operator_pay_for_work(
+                    "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                    "2026-09-01", "2026-09-20"))
+        self.assertEqual(preview["status"], "ok")
+        self.assertEqual(preview["good_bags"], 250)
         self.assertEqual(preview["amount_kobo"], 1250000)
+        self.assertEqual(preview["operator_id"], OPERATOR_ID)
+        self.assertEqual(preview["period"],
+            {"from": "2026-09-01", "to": "2026-09-20"})
 
-    def test_malformed_setting_is_missing(self):
-        async def fake_get(path, params=None):
-            return [{"value": {"amount_kobo": "lots"}}]
+    def test_work_preview_queries_confirmed_only(self):
+        seen = []
+        fake_get = self._work_client(
+            [{"good_quantity": 10}],
+            [{"value": {"amount_kobo": 5000}}], seen)
+        with patch("operator_pay.rest_get", side_effect=fake_get):
+            asyncio.run(operator_pay.preview_operator_pay_for_work(
+                "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                "2026-09-01", "2026-09-20"))
+        runs_params = [params for path, params in seen
+            if "biz_production_runs" in path][0]
+        # Drafts and voids can never contribute: the query admits only
+        # confirmed runs, only this operator, only this exact scope and
+        # period, and selects good quantities alone (rejected bags live
+        # in a column that is never read).
+        self.assertEqual(runs_params["status"], "eq.confirmed")
+        self.assertEqual(runs_params["produced_by"], "eq." + OPERATOR_ID)
+        self.assertEqual(runs_params["tenant_id"], "eq.tenant-1")
+        self.assertEqual(runs_params["business_id"],
+            "eq.amose_table_water")
+        self.assertEqual(runs_params["branch_id"], "eq.asaba")
+        self.assertEqual(runs_params["and"],
+            "(production_date.gte.2026-09-01,"
+            "production_date.lte.2026-09-20)")
+        self.assertEqual(runs_params["select"], "good_quantity")
 
+    def test_work_preview_cross_scope_cannot_contaminate(self):
+        seen = []
+        fake_get = self._work_client([], [], seen)
         with patch("operator_pay.rest_get", side_effect=fake_get):
             preview = asyncio.run(
-                operator_pay.preview_operator_pay_for_scope(
-                    "tenant-1", "water", "asaba", 250))
+                operator_pay.preview_operator_pay_for_work(
+                    "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                    "2026-09-01", "2026-09-20"))
+        # Another tenant/branch/operator's rows can never leak in: every
+        # read carries the exact scope filters.
+        for path, params in seen:
+            if "biz_production_runs" in path \
+                    or "biz_setting_versions" in path \
+                    or "biz_employees" in path \
+                    or "biz_assignments" in path:
+                self.assertEqual(params["tenant_id"], "eq.tenant-1")
+        scopes = [params for path, params in seen
+            if "biz_production_runs" in path][0]
+        self.assertEqual(scopes["business_id"], "eq.amose_table_water")
+        self.assertEqual(scopes["branch_id"], "eq.asaba")
+        self.assertEqual(preview["good_bags"], 0)
         self.assertEqual(preview["status"], "rate_not_configured")
+
+    def test_work_preview_caller_cannot_inject_bag_count(self):
+        with self.assertRaises(TypeError):
+            asyncio.run(operator_pay.preview_operator_pay_for_work(
+                "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                "2026-09-01", "2026-09-20", good_bags=250))
+
+    def test_work_preview_performs_no_writes(self):
+        # The module owns no write-capable callables: only rest_get is
+        # imported, so no code path here can post, patch, or delete.
+        for name in ("rest_post", "rest_patch", "rest_put", "rest_delete"):
+            self.assertFalse(hasattr(operator_pay, name), msg=name)
+        seen = []
+        fake_get = self._work_client(
+            [{"good_quantity": 5}],
+            [{"value": {"amount_kobo": 5000}}], seen)
+        with patch("operator_pay.rest_get", side_effect=fake_get):
+            asyncio.run(operator_pay.preview_operator_pay_for_work(
+                "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                "2026-09-01", "2026-09-01"))
+        self.assertTrue(seen)
+
+    def test_work_preview_without_setting(self):
+        seen = []
+        fake_get = self._work_client([{"good_quantity": 250}], [], seen)
+        with patch("operator_pay.rest_get", side_effect=fake_get):
+            preview = asyncio.run(
+                operator_pay.preview_operator_pay_for_work(
+                    "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                    "2026-09-01", "2026-09-20"))
+        self.assertEqual(preview["status"], "rate_not_configured")
+        self.assertEqual(preview["message"], "rate not configured")
+        # The confirmed total and source period are still reported.
+        self.assertEqual(preview["good_bags"], 250)
+        self.assertEqual(preview["period"],
+            {"from": "2026-09-01", "to": "2026-09-20"})
+        self.assertIsNone(preview["amount_kobo"])
+
+    def test_work_preview_malformed_setting_is_missing(self):
+        seen = []
+        fake_get = self._work_client(
+            [{"good_quantity": 250}],
+            [{"value": {"amount_kobo": "lots"}}], seen)
+        with patch("operator_pay.rest_get", side_effect=fake_get):
+            preview = asyncio.run(
+                operator_pay.preview_operator_pay_for_work(
+                    "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                    "2026-09-01", "2026-09-20"))
+        self.assertEqual(preview["status"], "rate_not_configured")
+
+    def test_work_preview_rejects_unassigned_operator(self):
+        async def fake_get(path, params=None):
+            if "biz_employees" in path:
+                return [{"id": OPERATOR_ID, "active": True}]
+            if "biz_assignments" in path:
+                return []
+            raise AssertionError("unexpected GET " + path)
+
+        with patch("operator_pay.rest_get", side_effect=fake_get):
+            with self.assertRaises(ValueError):
+                asyncio.run(operator_pay.preview_operator_pay_for_work(
+                    "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                    "2026-09-01", "2026-09-20"))
+
+    def test_work_preview_rejects_bad_period(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(operator_pay.preview_operator_pay_for_work(
+                "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                "2026-09-20", "2026-09-01"))
+        with self.assertRaises(ValueError):
+            asyncio.run(operator_pay.preview_operator_pay_for_work(
+                "tenant-1", "amose_table_water", "asaba", OPERATOR_ID,
+                "not-a-date", "2026-09-01"))
 
 
 # ---------------------------------------------------------------------------

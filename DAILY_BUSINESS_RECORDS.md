@@ -63,15 +63,30 @@ review (all other kinds). Reviewer messages never expose internal UUIDs.
 - `Vivian deposited 70000 to Access Bank, reference ABC123`
 - Fields: `amount_kobo`, `depositor_name`, `destination_account`,
   `reference` (required — a deposit is never confirmed without one).
-- Confirmation creates a single `deposit_confirmed` custody entry;
-  reusing an already-recorded reference is refused as a duplicate.
+- Confirmation requires an **owner-approved destination account**: the
+  latest effective `biz_setting_versions` row for the exact
+  tenant/business/branch with key `approved_bank_deposit_accounts` and
+  value `{"accounts": [{"name": "Access Bank", "reference": "ACC-01"},
+  ...]}`. Matching trims whitespace and ignores case; the custody
+  record keeps the canonical approved name. A missing, malformed, or
+  empty setting — or an unapproved account — fails closed. A deposit is
+  never confirmed from raw text alone.
+- Duplicate prevention is scoped by tenant, business, branch, **and**
+  destination account, compared case-insensitively after trimming, so
+  trivial variants cannot bypass it.
 
 ## Operator pay
 
-No message pays an operator. A preview is computed only from confirmed
-good-production bags and the owner-confirmed `operator_piece_rate_per_bag`
-setting. Without the setting the preview returns `rate not configured`,
-and no expense or cash movement is created until separately confirmed.
+No message pays an operator, and no caller-supplied bag total is ever
+accepted. `preview_operator_pay_for_work(tenant, business, branch,
+operator, date_from, date_to)` sums `good_quantity` from
+`status='confirmed'` production runs for that exact scope, operator, and
+inclusive work period (drafts/voids excluded, rejected bags never read)
+after validating the operator's assignment, then applies the
+owner-confirmed `operator_piece_rate_per_bag` setting. Without the
+setting the preview returns `rate not configured` (still reporting the
+confirmed total and source period). Read-only: no expense, payment, or
+cash movement is created until separately confirmed.
 
 ## Multi-branch senders
 

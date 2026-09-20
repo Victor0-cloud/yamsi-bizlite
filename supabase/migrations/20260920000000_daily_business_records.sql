@@ -97,12 +97,14 @@ comment on column public.biz_cash_custody_entries.deposit_reference is
   'bank_deposit only: the deposit reference/evidence required at confirmation.';
 
 -- Backstop for the deposit-duplicate rule: at most one confirmed entry
--- per (tenant, business, branch, destination account, reference).
--- Partial so existing rows (all NULL references) are unaffected, and NULL
--- destinations never collide with each other.
+-- per (tenant, business, branch, destination account, reference),
+-- compared case-insensitively after trimming so trivial variants cannot
+-- bypass it. Partial so existing rows (all NULL references) are
+-- unaffected, and NULLs never collide with each other.
 create unique index if not exists biz_cash_custody_deposit_ref_unique
   on public.biz_cash_custody_entries
-    (tenant_id, business_id, branch_id, destination_account, deposit_reference)
+    (tenant_id, business_id, branch_id,
+     (lower(btrim(destination_account))), (lower(btrim(deposit_reference))))
   where deposit_reference is not null;
 
 -- ---------------------------------------------------------------------------
@@ -644,7 +646,12 @@ $func$;
 -- ---------------------------------------------------------------------------
 -- 6. Bank-deposit posting: one confirmed deposit_confirmed custody entry +
 -- one verified Brain memory. The depositor resolves from authoritative
--- scoped rows; amount, destination account, and reference are required --
+-- scoped rows; amount, owner-approved destination account, and reference
+-- are required. Approval comes from the owner-confirmed
+-- biz_setting_versions key 'approved_bank_deposit_accounts' for this
+-- exact tenant/business/branch ({"accounts": [{"name": ..., "reference"?}]});
+-- matching is case-insensitive after trimming, the canonical approved
+-- name is stored, and anything absent/malformed/unapproved fails closed --
 -- raw text alone can never confirm a deposit because this RPC only runs
 -- inside the human-confirmation transaction on a verified block. A deposit
 -- reference already recorded for the same destination account in this
@@ -664,6 +671,7 @@ declare
   v_kind text; v_payload jsonb;
   v_ver jsonb;
   v_depositor uuid; v_amount bigint; v_dest text; v_ref text;
+  v_setting jsonb; v_acct jsonb; v_canonical_dest text;
   v_occurred timestamptz; v_recorded_by uuid;
   v_key_cust text;
   v_custody_id uuid; v_mem_id uuid;
@@ -743,14 +751,54 @@ begin
   if v_ref is null then
     raise exception 'MALFORMED: submission % verified block requires a non-empty reference', v_sub;
   end if;
+  -- Owner-approved destination account: the latest effective
+  -- 'approved_bank_deposit_accounts' setting for this exact
+  -- tenant/business/branch must exist, be well-formed
+  -- ({"accounts": [{"name": ..., "reference"?: ...}, ...]} with at least
+  -- one named account), and contain the supplied destination, compared
+  -- case-insensitively after trimming whitespace. The custody record
+  -- keeps the canonical approved name. Anything else fails closed: an
+  -- account is never trusted merely because it appeared in message text
+  -- or the verified block.
+  select s.value into v_setting
+    from public.biz_setting_versions s
+    where s.tenant_id = v_tenant and s.business_id = v_business
+      and s.branch_id = v_branch
+      and s.key = 'approved_bank_deposit_accounts'
+      and s.effective_from <= now()
+    order by s.effective_from desc
+    limit 1;
+  if not found
+      or v_setting is null or jsonb_typeof(v_setting) <> 'object'
+      or jsonb_typeof(v_setting -> 'accounts') <> 'array'
+      or jsonb_array_length(v_setting -> 'accounts') < 1 then
+    raise exception 'APPROVAL: no approved bank deposit accounts are configured for %/%', v_business, v_branch;
+  end if;
+  v_canonical_dest := null;
+  for v_acct in select value from jsonb_array_elements(v_setting -> 'accounts') as value loop
+    if jsonb_typeof(v_acct) = 'object'
+        and nullif(btrim(v_acct ->> 'name'), '') is not null
+        and btrim(lower(v_acct ->> 'name')) = btrim(lower(v_dest)) then
+      v_canonical_dest := btrim(v_acct ->> 'name');
+      exit;
+    end if;
+  end loop;
+  if v_canonical_dest is null then
+    raise exception 'APPROVAL: destination account % is not an approved bank deposit account for %/%',
+      v_dest, v_business, v_branch;
+  end if;
+  v_dest := v_canonical_dest;
   -- Duplicate prevention: this reference is already confirmed for this
   -- destination account in this scope under a different submission (a
-  -- double-report of one deposit). Scoped by tenant, business, branch,
-  -- AND destination account.
+  -- double-report of one deposit). Both sides are compared
+  -- case-insensitively after trimming, so trivial variants cannot
+  -- bypass detection. Scoped by tenant, business, branch, AND
+  -- destination account.
   if exists (select 1 from public.biz_cash_custody_entries c
       where c.tenant_id = v_tenant and c.business_id = v_business
-        and c.branch_id = v_branch and c.destination_account = v_dest
-        and c.deposit_reference = v_ref
+        and c.branch_id = v_branch
+        and btrim(lower(c.destination_account)) = btrim(lower(v_dest))
+        and btrim(lower(c.deposit_reference)) = btrim(lower(v_ref))
         and c.idempotency_key is distinct from v_key_cust) then
     raise exception 'CONFLICT: deposit reference % is already recorded for % in %/%', v_ref, v_dest, v_business, v_branch;
   end if;
