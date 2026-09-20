@@ -157,6 +157,7 @@ class ProcessInboxTests(unittest.TestCase):
     def test_unknown_sender(self):
         summary, client = self._run([inbox_row()], [], [])
         self.assertEqual(summary, {"scanned": 1, "submitted": 0, "unmatched": 1, "skipped_non_message": 0,
+            "clarifications_queued": 0,
             "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
             "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
             "review_requests_queued": 0, "review_requests_failed": 0,
