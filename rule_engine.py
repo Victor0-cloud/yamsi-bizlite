@@ -21,6 +21,15 @@ import evidence_store
 import notifier
 
 NUGHE_FARMS_WARRI = ("nughe_farms", "warri")
+
+# Authoritative AMOSE water-business scope (business id "amose_table_water"
+# with its Asaba and Warri branches, per the test_brain AMOSE_ASABA
+# fixture, the operational-posting amose_table_water/asaba fixture, and
+# the rule_engine amose_table_water asaba/warri fixtures). Only this
+# scope receives the Stage 1 water-business intake (water_intake); every
+# other business/branch keeps its previous extraction behavior exactly.
+AMOSE_TABLE_WATER = "amose_table_water"
+AMOSE_WATER_BRANCHES = frozenset({"asaba", "warri"})
 REMINDER_POLICY_KEY = "evidence_reminder_policy"
 DAILY_REPORT_POLICY_KEY = "daily_reporting_requirement"
 
@@ -103,7 +112,13 @@ def parse_poultry_report(text):
 
 def extract(business_id, branch_id, text, received_at=None):
     """Business-scoped extraction dispatch. Only nughe_farms/warri gets the
-    poultry parser; every other business/branch is untouched."""
+    poultry parser; only the AMOSE water-business scope
+    (amose_table_water asaba/warri) gets the deterministic Stage 1
+    water-business intake (water_intake.extract_water_record), which
+    recognizes production, sale, payment, expense, cash_handover, and
+    bank_deposit drafts. Every other business/branch keeps the previous
+    generic sale parsing behavior exactly. Intake creates drafts only
+    and never writes."""
     if (business_id, branch_id) == NUGHE_FARMS_WARRI:
         parsed = parse_poultry_report(text)
         if received_at:
@@ -116,6 +131,18 @@ def extract(business_id, branch_id, text, received_at=None):
         else:
             parsed["missing_fields"].append("reporting_date")
         return {"kind": "poultry_daily_report", **parsed}
+    if business_id == AMOSE_TABLE_WATER and branch_id in AMOSE_WATER_BRANCHES:
+        from water_intake import extract_water_record
+        parsed = extract_water_record(text)
+        if parsed["kind"] == "production" and "production_date" in parsed["missing_fields"] and received_at:
+            date_part = received_at[:10] if isinstance(received_at, str) else None
+            if date_part:
+                parsed["fields"]["production_date"] = date_part
+                parsed["provenance"]["production_date"] = "system_derived"
+                parsed["missing_fields"] = [key for key in parsed["missing_fields"] if key != "production_date"]
+        return {"kind": parsed["kind"] or "whatsapp_message", "intent": parsed["intent"],
+            "fields": parsed["fields"], "provenance": parsed["provenance"],
+            "missing_fields": parsed["missing_fields"], "errors": parsed["errors"]}
     from message_processor import parse_message
     sale = parse_message(text)
     return {"kind": sale["intent"] or "whatsapp_message", "intent": sale["intent"],

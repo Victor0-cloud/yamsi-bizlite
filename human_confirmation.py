@@ -29,6 +29,8 @@ Submission-kind mapping (explicit; must stay in sync with the migration):
     'sale'                   sale           amose_confirm_submission
     'payment'                payment        amose_confirm_submission
     'expense'                expense        amose_confirm_submission
+    'cash_handover'          cash_handover  amose_confirm_submission
+    'bank_deposit'           bank_deposit   amose_confirm_submission
     anything else            --             rejected, no RPC call
 
 Safety properties (enforced, tested in test_human_confirmation.py):
@@ -102,6 +104,8 @@ KIND_TO_POSTING = {
     "sale": "sale",
     "payment": "payment",
     "expense": "expense",
+    "cash_handover": "cash_handover",
+    "bank_deposit": "bank_deposit",
 }
 
 # posting type -> RPC result IDs that must be present, non-empty strings.
@@ -110,6 +114,8 @@ REQUIRED_RESULT_IDS = {
     "sale": ("sale_id", "brain_memory_id"),
     "payment": ("payment_id", "brain_memory_id"),
     "expense": ("expense_id", "brain_memory_id"),
+    "cash_handover": ("cash_custody_entry_id", "brain_memory_id"),
+    "bank_deposit": ("cash_custody_entry_id", "brain_memory_id"),
 }
 
 VALID_REVIEW_ACTIONS = frozenset({"confirmed", "corrected"})
@@ -120,7 +126,8 @@ PRODUCTION_SHIFTS = frozenset({"morning", "afternoon", "night", "full_day"})
 SALE_STORAGE_STATES = frozenset({"normal", "cold"})
 PAYMENT_METHODS = frozenset({"cash", "transfer", "pos", "credit_adjustment"})
 EXPENSE_CATEGORIES = frozenset({"fuel", "maintenance", "salaries", "transport",
-    "packaging", "utilities", "rent", "purchases", "other"})
+    "packaging", "utilities", "rent", "purchases", "other",
+    "task_force", "atwap_dues", "tricycle_service"})
 EXPENSE_PAYMENT_METHODS = frozenset({"cash", "transfer", "pos", "other"})
 
 
@@ -405,6 +412,52 @@ def _validate_expense(verified, errors):
         if _is_strict_int(verified.get("amount_kobo")) else None}
 
 
+def _validate_cash_handover(verified, errors):
+    """Verified handover: both custodians are authoritative employee UUIDs
+    (resolved from scoped database records, never from message text), the
+    parties differ, and the amount is positive. Returns computed totals."""
+    from_id = _require_uuid(errors, verified.get("from_employee_id"),
+        "from_employee_id")
+    to_id = _require_uuid(errors, verified.get("to_employee_id"),
+        "to_employee_id")
+    if isinstance(verified.get("from_employee_id"), str) \
+            and isinstance(verified.get("to_employee_id"), str) \
+            and verified["from_employee_id"] == verified["to_employee_id"]:
+        errors.append("from_employee_id and to_employee_id must differ; "
+            "self-handover is not allowed")
+    _require_int(errors, verified.get("amount_kobo"), "amount_kobo",
+        minimum=1)
+    if "handed_at" in verified:
+        _optional_timestamp(errors, verified.get("handed_at"), "handed_at")
+    if "recorded_by" in verified:
+        _optional_uuid(errors, verified.get("recorded_by"), "recorded_by")
+    return {"amount_kobo": verified.get("amount_kobo")
+        if _is_strict_int(verified.get("amount_kobo")) else None}
+
+
+def _validate_bank_deposit(verified, errors):
+    """Verified deposit: the depositor is an authoritative employee UUID,
+    and amount, approved destination account, and deposit reference are
+    all present. A deposit is never confirmed without a reference."""
+    _require_uuid(errors, verified.get("deposited_by"), "deposited_by")
+    _require_int(errors, verified.get("amount_kobo"), "amount_kobo",
+        minimum=1)
+    destination = verified.get("destination_account")
+    if not isinstance(destination, str) or not destination.strip():
+        errors.append("destination_account must be a non-empty string")
+    reference = verified.get("reference")
+    if not isinstance(reference, str) or not reference.strip():
+        errors.append("reference must be a non-empty string; a deposit is "
+            "never confirmed without a reference")
+    if "deposited_at" in verified:
+        _optional_timestamp(errors, verified.get("deposited_at"),
+            "deposited_at")
+    if "recorded_by" in verified:
+        _optional_uuid(errors, verified.get("recorded_by"), "recorded_by")
+    return {"amount_kobo": verified.get("amount_kobo")
+        if _is_strict_int(verified.get("amount_kobo")) else None}
+
+
 def validate_verified(kind, verified):
     """Pure preview validation for one verified snapshot. Returns
     {"kind", "posting_type", "verified" (normalized copy), "computed"} or
@@ -431,6 +484,10 @@ def validate_verified(kind, verified):
         computed = _validate_payment(normalized, errors)
     elif posting_type == "expense":
         computed = _validate_expense(normalized, errors)
+    elif posting_type == "cash_handover":
+        computed = _validate_cash_handover(normalized, errors)
+    elif posting_type == "bank_deposit":
+        computed = _validate_bank_deposit(normalized, errors)
     else:  # Unreachable: posting_for_kind already allowlisted the kind.
         raise UnsupportedKindError("Unsupported submission kind: %r" % (kind,))
     if errors:
