@@ -15,6 +15,8 @@ supabase/migrations/20260917202233_operational_posting_layer.sql):
     'sale'                   sale           amose_post_sale
     'payment'                payment        amose_post_payment
     'expense'                expense        amose_post_expense
+    'cash_handover'          cash_handover  amose_post_cash_handover
+    'bank_deposit'           bank_deposit   amose_post_bank_deposit
     anything else            --             rejected, no RPC call, no records
 
 'production' is the canonical AMOSE posting kind. 'poultry_daily_report' is
@@ -59,6 +61,8 @@ KIND_TO_POSTING = {
     "sale": ("sale", "amose_post_sale"),
     "payment": ("payment", "amose_post_payment"),
     "expense": ("expense", "amose_post_expense"),
+    "cash_handover": ("cash_handover", "amose_post_cash_handover"),
+    "bank_deposit": ("bank_deposit", "amose_post_bank_deposit"),
 }
 
 # The complete allowlist: the only database functions this module may call.
@@ -67,6 +71,8 @@ RPC_ALLOWLIST = frozenset({
     "amose_post_sale",
     "amose_post_payment",
     "amose_post_expense",
+    "amose_post_cash_handover",
+    "amose_post_bank_deposit",
 })
 
 CONFIRMED_STATUS = "confirmed"
@@ -78,6 +84,8 @@ REQUIRED_RESULT_IDS = {
     "sale": ("sale_id", "brain_memory_id"),
     "payment": ("payment_id", "brain_memory_id"),
     "expense": ("expense_id", "brain_memory_id"),
+    "cash_handover": ("cash_custody_entry_id", "brain_memory_id"),
+    "bank_deposit": ("cash_custody_entry_id", "brain_memory_id"),
 }
 
 VALID_RESULT_STATUSES = frozenset({"posted", "already_posted"})
