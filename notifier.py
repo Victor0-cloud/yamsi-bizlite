@@ -41,8 +41,9 @@ async def queue_message(tenant_id, business_id, branch_id, recipient_employee_id
 
 async def dispatch_queued_message(message_row, phone_number_id):
     """Performs the real send for a single already-queued (or already-
-    claimed, status='sending' -- see outbound_dispatch_worker) message. Not
-    invoked automatically anywhere in this codebase (see module docstring)."""
+    claimed, status='sending' -- see outbound_dispatch_worker) message.
+    Reached only through the dispatch worker (webhook background trigger
+    or owner endpoint), never directly from ingestion."""
     if message_row["status"] not in ("queued", "sending") or not message_row.get("provider_sender"):
         return message_row
     try:
