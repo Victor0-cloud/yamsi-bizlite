@@ -86,6 +86,22 @@ async def save_events(rows):
     except (httpx.HTTPError, DatabaseUnavailable):
         raise HTTPException(503, "Inbox unavailable; retry delivery") from None
 
+AUTO_DISPATCH_LIMIT = 10
+
+
+async def _trigger_dispatch(limit=AUTO_DISPATCH_LIMIT):
+    """Best-effort bounded dispatch pass: claims queued outbound rows once
+    each and sends them, recording retry state on failure. All errors are
+    swallowed -- dispatch trouble is recorded on the rows themselves (see
+    outbound_dispatch_worker.dispatch_pending) and must never surface here,
+    let alone fail the webhook acknowledgement that already went out."""
+    from outbound_dispatch_worker import dispatch_pending
+    try:
+        await dispatch_pending(limit=limit)
+    except Exception:
+        pass
+
+
 async def _trigger_processing():
     """Best-effort, fire-and-forget: runs strictly AFTER the durable inbox
     insert has already succeeded, scheduled as a FastAPI background task so
@@ -95,12 +111,17 @@ async def _trigger_processing():
     message_processor.process_inbox_batch) and is picked up by a later
     call, whether that's the next webhook delivery's background task or a
     manual POST /internal/process-whatsapp-inbox. Nothing performed here can
-    ever cause a message to be lost or duplicated."""
+    ever cause a message to be lost or duplicated. After processing, one
+    bounded dispatch pass is attempted the same contained way, so replies
+    queued by this delivery (e.g. branch_clarification) are sent without
+    waiting for an operator; POST /internal/dispatch-outbound remains for
+    backlog and recovery."""
     from message_processor import process_inbox_batch
     try:
         await process_inbox_batch()
     except Exception:
         pass
+    await _trigger_dispatch()
 
 @router.post("/webhooks/whatsapp")
 async def receive(request: Request, background_tasks: BackgroundTasks):

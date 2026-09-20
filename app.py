@@ -103,6 +103,21 @@ async def telegram_review_sync(data: dict):
     except DatabaseUnavailable:
         raise HTTPException(503, "Telegram sync unavailable; check server configuration")
 
+@app.post("/internal/dispatch-outbound", dependencies=[Depends(require_api_key)])
+async def dispatch_outbound(data: dict):
+    """Runs one bounded outbound-dispatch pass (claim each queued row once,
+    send via the stored provider_account, record retry state on failure).
+    Administrative backlog/recovery tool: the WhatsApp webhook background
+    trigger already attempts one bounded pass per delivery, so this route
+    is for draining backlog after incidents. Optional JSON body
+    {"limit": N} bounds the pass (1..100, default 20)."""
+    import outbound_dispatch_worker
+    try:
+        return await outbound_dispatch_worker.dispatch_pending(
+            limit=outbound_dispatch_worker.parse_limit((data or {}).get("limit")))
+    except DatabaseUnavailable:
+        raise HTTPException(503, "Outbound dispatch unavailable; check server configuration")
+
 @app.post("/internal/owner-query", dependencies=[Depends(require_api_key)])
 async def owner_query_endpoint(data: dict):
     # Only the owner holds YAMSI_API_KEY today; there is no separate staff

@@ -1,16 +1,28 @@
 """Outbound dispatch worker: claims queued biz_outbound_messages rows and
 sends them through notifier/outbound_whatsapp, recording retry state on
-failure. NOT invoked automatically by anything in this codebase -- suitable
-for a future protected internal endpoint or scheduled invocation (Stage
-007C scope is the callable worker itself, not wiring it in). No production
-message is sent by running this module's tests: every Meta call notifier
-makes is mocked.
+failure. Production entry points: the WhatsApp webhook background trigger
+(one bounded pass per delivery, errors contained) and the owner-gated
+POST /internal/dispatch-outbound route for backlog and recovery (see app.py).
+No polling loop or scheduler exists. No production message is sent by
+running this module's tests: every Meta call notifier makes is mocked.
 """
 from supabase_backend import rest_get, rest_patch
 import notifier
 import retry_engine
 
 BATCH_LIMIT = 20
+MAX_LIMIT = 100
+
+
+def parse_limit(value):
+    """Bounds an owner-supplied dispatch batch size to 1..MAX_LIMIT.
+    Pure helper (no I/O) so the validation is unit-testable on its own;
+    missing or non-numeric input falls back to BATCH_LIMIT."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return BATCH_LIMIT
+    return max(1, min(limit, MAX_LIMIT))
 
 
 async def _claim(message_id):

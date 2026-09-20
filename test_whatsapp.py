@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 from app import app
-from whatsapp_webhook import extract_events, save_events
+from whatsapp_webhook import AUTO_DISPATCH_LIMIT, extract_events, save_events
+import whatsapp_webhook
 
 class WebhookTests(unittest.TestCase):
     def setUp(self):
@@ -49,6 +50,11 @@ class WebhookTests(unittest.TestCase):
         with patch("whatsapp_webhook.save_events",new_callable=AsyncMock) as save:
             self.assertEqual(self.send(self.payload).status_code,200)
             self.assertEqual(save.call_args.args[0][0]["payload"]["kind"],"message")
+    def test_background_trigger_attempts_bounded_dispatch(self):
+        with patch("whatsapp_webhook.save_events",new_callable=AsyncMock), \
+             patch("outbound_dispatch_worker.dispatch_pending",new_callable=AsyncMock) as run:
+            self.assertEqual(self.send(self.payload).status_code,200)
+        run.assert_called_once_with(limit=AUTO_DISPATCH_LIMIT)
     def test_unsigned_rejected(self):
         with patch("whatsapp_webhook.save_events",new_callable=AsyncMock) as save:
             self.assertEqual(self.client.post("/webhooks/whatsapp",json=self.payload).status_code,403)
@@ -77,6 +83,35 @@ class WebhookTests(unittest.TestCase):
             self.assertEqual(self.send(self.payload).status_code,503)
     def test_oversized(self):
         self.assertEqual(self.client.post("/webhooks/whatsapp",content=b"x"*(1024*1024+1)).status_code,413)
+
+class TriggerDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def _trigger(self, process_effect=None, dispatch_effect=None):
+        calls = []
+        async def fake_process():
+            calls.append("process")
+            if isinstance(process_effect, Exception):
+                raise process_effect
+            return {"scanned": 1, "clarifications_queued": 1}
+        async def fake_dispatch(limit=None):
+            calls.append(("dispatch", limit))
+            if isinstance(dispatch_effect, Exception):
+                raise dispatch_effect
+            return {"scanned": 1, "sent": 1}
+        with patch("message_processor.process_inbox_batch",new_callable=AsyncMock,side_effect=fake_process), \
+             patch("outbound_dispatch_worker.dispatch_pending",new_callable=AsyncMock,side_effect=fake_dispatch) as run:
+            await whatsapp_webhook._trigger_processing()
+        return calls, run
+    async def test_batch_queues_then_dispatch_is_attempted_in_order(self):
+        calls, run = await self._trigger()
+        self.assertEqual(calls, ["process", ("dispatch", AUTO_DISPATCH_LIMIT)])
+        run.assert_called_once_with(limit=AUTO_DISPATCH_LIMIT)
+    async def test_dispatch_failure_never_fails_trigger(self):
+        calls, run = await self._trigger(dispatch_effect=RuntimeError("db down"))
+        self.assertEqual(calls, ["process", ("dispatch", AUTO_DISPATCH_LIMIT)])
+    async def test_process_failure_still_attempts_dispatch(self):
+        calls, run = await self._trigger(process_effect=RuntimeError("db down"))
+        self.assertEqual(calls, ["process", ("dispatch", AUTO_DISPATCH_LIMIT)])
+        run.assert_called_once_with(limit=AUTO_DISPATCH_LIMIT)
 
 class PersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_atomic_conflict_request(self):

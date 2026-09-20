@@ -78,6 +78,39 @@ class DispatchQueuedMessageTests(unittest.TestCase):
         rpatch.assert_not_called()
         self.assertEqual(result["status"], "skipped_no_identity")
 
+    # The send uses exactly the row's recipient, business number, and text:
+    # a queued clarification reaches its stored sender unaltered.
+    def test_send_uses_row_recipient_number_and_text(self):
+        row = {"id": "msg-9", "status": "queued", "provider_sender": "+12025550123",
+            "message_text": "Please begin your message with ASABA: or WARRI: so YAMSI knows which branch to use."}
+        with patch("notifier.outbound_whatsapp.send_text_message", new_callable=AsyncMock,
+                    return_value={"provider_message_id": "wamid.9"}) as send, \
+             patch("notifier.rest_patch", new_callable=AsyncMock) as rpatch:
+            result = asyncio.run(notifier.dispatch_queued_message(row, "1350537361474836"))
+        send.assert_called_once_with("1350537361474836", "+12025550123", row["message_text"])
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["provider_message_id"], "wamid.9")
+        body = rpatch.call_args.args[2]
+        self.assertEqual(body["status"], "sent")
+        self.assertEqual(body["provider_message_id"], "wamid.9")
+        self.assertIn("sent_at", body)
+
+    # A send failure records the row failed without ever persisting the
+    # access token, even though the token was configured in the environment.
+    def test_failed_send_records_safely_without_token(self):
+        row = {"id": "msg-9", "status": "queued", "provider_sender": "+12025550123",
+            "message_text": "Please begin your message with ASABA: or WARRI: so YAMSI knows which branch to use."}
+        with patch.dict("os.environ", {"WHATSAPP_ACCESS_TOKEN": "sentinel-token-abc123"}), \
+             patch("notifier.outbound_whatsapp.send_text_message", new_callable=AsyncMock,
+                    side_effect=outbound_whatsapp.OutboundUnavailable("WhatsApp API returned status 400")), \
+             patch("notifier.rest_patch", new_callable=AsyncMock) as rpatch:
+            result = asyncio.run(notifier.dispatch_queued_message(row, "1350537361474836"))
+        self.assertEqual(result["status"], "failed")
+        body = rpatch.call_args.args[2]
+        self.assertEqual(body["status"], "failed")
+        self.assertNotIn("sentinel-token-abc123", body.get("failure_reason", ""))
+        self.assertNotIn("sentinel-token-abc123", str(body))
+
 
 if __name__ == "__main__":
     unittest.main()
