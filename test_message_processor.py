@@ -6,6 +6,8 @@ import httpx
 from fastapi.testclient import TestClient
 from app import app
 from message_processor import parse_message, process_inbox_batch
+from message_processor import _split_branch_prefix, _match_assignment
+from message_processor import _resolve_multi_assignment, _clarification_text
 
 MESSAGE_EVENT = {"from": "+12025550123", "type": "text", "text": {"body": "Sold 50 bags at 500"}}
 
@@ -51,8 +53,45 @@ class ParseMessageTests(unittest.TestCase):
         self.assertEqual(result["errors"], ["Empty or missing message text"])
 
 
+class BranchPrefixTests(unittest.TestCase):
+    PAIRS = [("water", "asaba"), ("water", "warri")]
+
+    def test_split_prefix(self):
+        self.assertEqual(_split_branch_prefix("ASABA: Sold 100 bags"), ("ASABA", "Sold 100 bags"))
+        self.assertEqual(_split_branch_prefix("aSaBa : Sold 10 bags"), ("aSaBa", "Sold 10 bags"))
+        self.assertEqual(_split_branch_prefix("ASABA:"), ("ASABA", ""))
+        self.assertEqual(_split_branch_prefix("hello world"), (None, "hello world"))
+        self.assertEqual(_split_branch_prefix(""), (None, ""))
+        self.assertEqual(_split_branch_prefix(None), (None, None))
+
+    def test_match_assignment(self):
+        self.assertEqual(_match_assignment(self.PAIRS, "asaba"), ("water", "asaba"))
+        self.assertEqual(_match_assignment(self.PAIRS, "WARRI"), ("water", "warri"))
+        self.assertIsNone(_match_assignment(self.PAIRS, "lagos"))
+        self.assertIsNone(_match_assignment(self.PAIRS, ""))
+        self.assertIsNone(_match_assignment(self.PAIRS, None))
+        ambiguous = [("water", "warri"), ("phone_center", "warri")]
+        self.assertIsNone(_match_assignment(ambiguous, "warri"))
+
+    def test_resolve_multi_assignment(self):
+        resolved = _resolve_multi_assignment(self.PAIRS, "WARRI: Produced 200 bags")
+        self.assertEqual(resolved, (("water", "warri"), "Produced 200 bags"))
+        self.assertIsNone(_resolve_multi_assignment(self.PAIRS, "Sold 50 bags"))
+        self.assertIsNone(_resolve_multi_assignment(self.PAIRS, "LAGOS: Sold 50 bags"))
+        self.assertIsNone(_resolve_multi_assignment(self.PAIRS, "ASABA:"))
+        self.assertIsNone(_resolve_multi_assignment(self.PAIRS, "ASABA:   "))
+        self.assertIsNone(_resolve_multi_assignment(self.PAIRS, None))
+
+    def test_clarification_text(self):
+        self.assertEqual(_clarification_text(self.PAIRS),
+            "Please begin your message with ASABA: or WARRI: so YAMSI knows which branch to use.")
+        self.assertEqual(_clarification_text(
+                [("water", "asaba"), ("water", "warri"), ("water", "aba")]),
+            "Please begin your message with ABA:, ASABA:, or WARRI: so YAMSI knows which branch to use.")
+
+
 class ProcessInboxTests(unittest.TestCase):
-    def _client(self, identities, assignments, post_status=201, patch_status=204):
+    def _client(self, identities, assignments, post_status=201, patch_status=204, outbound_existing=None):
         client = AsyncMock()
         async def fake_get(path, params=None):
             if path == "/rest/v1/biz_message_inbox":
@@ -63,6 +102,8 @@ class ProcessInboxTests(unittest.TestCase):
                 return httpx.Response(200, json=assignments)
             if path == "/rest/v1/biz_submissions":
                 return httpx.Response(200, json=[{"id": SUBMISSION_UUID}])
+            if path == "/rest/v1/biz_outbound_messages":
+                return httpx.Response(200, json=list(outbound_existing or []))
             raise AssertionError("unexpected GET " + path)
         async def fake_post(path, json=None, params=None, headers=None):
             if path == "/rest/v1/rpc/amose_queue_review_requests":
@@ -78,9 +119,9 @@ class ProcessInboxTests(unittest.TestCase):
         client.patch = AsyncMock(return_value=httpx.Response(patch_status))
         return client
 
-    def _run(self, inbox_rows, identities, assignments, post_status=201, patch_status=204):
+    def _run(self, inbox_rows, identities, assignments, post_status=201, patch_status=204, outbound_existing=None):
         self._inbox_rows = inbox_rows
-        client = self._client(identities, assignments, post_status, patch_status)
+        client = self._client(identities, assignments, post_status, patch_status, outbound_existing)
         with patch("message_processor.credentials", return_value=("https://example.supabase.co", "test-key")), \
              patch("message_processor.httpx.AsyncClient") as factory:
             factory.return_value.__aenter__.return_value = client
@@ -94,6 +135,7 @@ class ProcessInboxTests(unittest.TestCase):
             [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
             [{"business_id": "water", "branch_id": "warri"}])
         self.assertEqual(summary, {"scanned": 1, "submitted": 1, "unmatched": 0, "skipped_non_message": 0,
+            "clarifications_queued": 0,
             "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
             "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
             "review_requests_queued": 1, "review_requests_failed": 0,
@@ -115,6 +157,7 @@ class ProcessInboxTests(unittest.TestCase):
     def test_unknown_sender(self):
         summary, client = self._run([inbox_row()], [], [])
         self.assertEqual(summary, {"scanned": 1, "submitted": 0, "unmatched": 1, "skipped_non_message": 0,
+            "clarifications_queued": 0,
             "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
             "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
             "review_requests_queued": 0, "review_requests_failed": 0,
@@ -169,6 +212,7 @@ class ProcessInboxTests(unittest.TestCase):
         # row is marked processed, a fresh scan returns nothing left to submit.
         summary2, client2 = self._run([], [], [])
         self.assertEqual(summary2, {"scanned": 0, "submitted": 0, "unmatched": 0, "skipped_non_message": 0,
+            "clarifications_queued": 0,
             "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
             "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
             "review_requests_queued": 0, "review_requests_failed": 0,
@@ -187,13 +231,167 @@ class ProcessInboxTests(unittest.TestCase):
         client.post.assert_not_called()
 
     def test_unmapped_business_ambiguous_assignment(self):
+        # Same branch code in two businesses is ambiguous: no submission, no
+        # guessing -- one branch-selection clarification is queued instead.
         summary, client = self._run(
             [inbox_row()],
             [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
             [{"business_id": "water", "branch_id": "warri"}, {"business_id": "phone_center", "branch_id": "warri"}])
         self.assertEqual(summary["submitted"], 0)
         self.assertEqual(summary["unmatched"], 1)
-        client.post.assert_not_called()
+        self.assertEqual(summary["clarifications_queued"], 1)
+        submissions = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"]
+        self.assertEqual(submissions, [])
+        queued = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_outbound_messages"]
+        self.assertEqual(len(queued), 1)
+        row = queued[0].kwargs["json"][0]
+        self.assertEqual(row["message_type"], "branch_clarification")
+        self.assertEqual(row["idempotency_key"], "inbox-1:branch_clarification")
+        self.assertIsNone(row["business_id"])
+        self.assertIsNone(row["branch_id"])
+        self.assertIsNone(row["related_task_id"])
+        self.assertEqual(row["recipient_employee_id"], "emp-1")
+        self.assertEqual(row["provider_sender"], "+12025550123")
+        self.assertIn("WARRI:", row["message_text"])
+        self.assertEqual(client.patch.call_args.kwargs["json"], {"status": "unmatched"})
+
+    # Multi-branch prefix selection (sender holds water/asaba + water/warri).
+    def _multi_assignments(self):
+        return [{"business_id": "water", "branch_id": "asaba"},
+            {"business_id": "water", "branch_id": "warri"}]
+
+    def _multi_identities(self):
+        return [{"tenant_id": "tenant-1", "employee_id": "emp-1"}]
+
+    def _text_event(self, body):
+        return {"from": "+12025550123", "type": "text", "text": {"body": body}}
+
+    def _clarification_posts(self, client):
+        return [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_outbound_messages"]
+
+    def _submission_posts(self, client):
+        return [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"]
+
+    def test_single_assignment_colon_text_unchanged(self):
+        # One assignment: the automatic branch stands and the full original
+        # text (colon included) reaches extraction untouched.
+        event = self._text_event("Note: Sold 50 bags at 500")
+        summary, client = self._run(
+            [inbox_row(event=event)],
+            self._multi_identities(),
+            [{"business_id": "water", "branch_id": "warri"}])
+        self.assertEqual(summary["submitted"], 1)
+        self.assertEqual(summary["clarifications_queued"], 0)
+        submitted = self._submission_posts(client)[0].kwargs["json"][0]
+        self.assertEqual(submitted["branch_id"], "warri")
+        self.assertEqual(submitted["payload"]["message_text"], "Note: Sold 50 bags at 500")
+        self.assertEqual(self._clarification_posts(client), [])
+
+    def test_multi_branch_asaba_prefix(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("ASABA: Sold 100 bags at 500"))],
+            self._multi_identities(), self._multi_assignments())
+        self.assertEqual(summary["submitted"], 1)
+        self.assertEqual(summary["unmatched"], 0)
+        self.assertEqual(summary["clarifications_queued"], 0)
+        submitted = self._submission_posts(client)[0].kwargs["json"][0]
+        self.assertEqual(submitted["business_id"], "water")
+        self.assertEqual(submitted["branch_id"], "asaba")
+        self.assertEqual(submitted["payload"]["message_text"], "Sold 100 bags at 500")
+        self.assertEqual(submitted["payload"]["parsed"]["fields"]["quantity"], 100.0)
+        self.assertEqual(self._clarification_posts(client), [])
+
+    def test_multi_branch_warri_prefix(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("WARRI: Produced 200 bags"))],
+            self._multi_identities(), self._multi_assignments())
+        self.assertEqual(summary["submitted"], 1)
+        submitted = self._submission_posts(client)[0].kwargs["json"][0]
+        self.assertEqual(submitted["branch_id"], "warri")
+        self.assertEqual(submitted["payload"]["message_text"], "Produced 200 bags")
+        self.assertEqual(self._clarification_posts(client), [])
+
+    def test_prefix_matching_case_insensitive(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("aSaBa : Sold 10 bags at 100"))],
+            self._multi_identities(), self._multi_assignments())
+        self.assertEqual(summary["submitted"], 1)
+        submitted = self._submission_posts(client)[0].kwargs["json"][0]
+        self.assertEqual(submitted["branch_id"], "asaba")
+        self.assertEqual(submitted["payload"]["message_text"], "Sold 10 bags at 100")
+
+    def test_missing_prefix_queues_clarification(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("Sold 50 bags at 500"))],
+            self._multi_identities(), self._multi_assignments())
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["unmatched"], 1)
+        self.assertEqual(summary["clarifications_queued"], 1)
+        self.assertEqual(self._submission_posts(client), [])
+        queued = self._clarification_posts(client)
+        self.assertEqual(len(queued), 1)
+        row = queued[0].kwargs["json"][0]
+        self.assertEqual(row["message_type"], "branch_clarification")
+        self.assertIn("ASABA:", row["message_text"])
+        self.assertIn("WARRI:", row["message_text"])
+        self.assertEqual(client.patch.call_args.kwargs["json"], {"status": "unmatched"})
+
+    def test_invalid_prefix_queues_clarification(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("LAGOS: Sold 50 bags at 500"))],
+            self._multi_identities(), self._multi_assignments())
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["unmatched"], 1)
+        self.assertEqual(summary["clarifications_queued"], 1)
+        self.assertEqual(self._submission_posts(client), [])
+        self.assertEqual(len(self._clarification_posts(client)), 1)
+
+    def test_unassigned_branch_prefix_queues_clarification(self):
+        # 'aba' is a real-looking branch code but not assigned to this sender.
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("ABA: Sold 50 bags at 500"))],
+            self._multi_identities(), self._multi_assignments())
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["clarifications_queued"], 1)
+        self.assertEqual(self._submission_posts(client), [])
+
+    def test_empty_prefixed_message_queues_clarification(self):
+        for body in ("ASABA:", "ASABA:   "):
+            summary, client = self._run(
+                [inbox_row(event=self._text_event(body))],
+                self._multi_identities(), self._multi_assignments())
+            self.assertEqual(summary["submitted"], 0)
+            self.assertEqual(summary["clarifications_queued"], 1)
+            self.assertEqual(self._submission_posts(client), [])
+
+    def test_review_commands_need_no_prefix(self):
+        with patch("message_processor.review_service.handle_review_command",
+                new_callable=AsyncMock) as handle:
+            summary, client = self._run(
+                [inbox_row(event=self._text_event("REVIEW CONFIRM YR-ABCD234EFG KEY k1"))],
+                self._multi_identities(), self._multi_assignments())
+        handle.assert_called_once()
+        self.assertEqual(handle.call_args.args[2], "+12025550123")
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["clarifications_queued"], 0)
+        self.assertEqual(self._submission_posts(client), [])
+        self.assertEqual(self._clarification_posts(client), [])
+
+    def test_retry_sends_single_clarification(self):
+        rows = [inbox_row(event=self._text_event("Sold 50 bags at 500"))]
+        summary, client = self._run(rows, self._multi_identities(), self._multi_assignments())
+        self.assertEqual(len(self._clarification_posts(client)), 1)
+        # A retry re-processes the same received row; the existing queued
+        # clarification is found first, so nothing is posted again.
+        summary2, client2 = self._run(
+            rows, self._multi_identities(), self._multi_assignments(),
+            outbound_existing=[{"id": "out-1"}])
+        self.assertEqual(summary2["clarifications_queued"], 0)
+        self.assertEqual(self._clarification_posts(client2), [])
 
     # 7. no accounting transaction created before approval: ingestion
     # performs reads, one draft submission insert, one idempotent
@@ -234,6 +432,7 @@ class ProcessInboxTests(unittest.TestCase):
         event = {"id": "wamid.1", "status": "delivered", "timestamp": "123"}
         summary, client = self._run([inbox_row(event=event, kind="status")], [], [])
         self.assertEqual(summary, {"scanned": 1, "submitted": 0, "unmatched": 0, "skipped_non_message": 1,
+            "clarifications_queued": 0,
             "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
             "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
             "review_requests_queued": 0, "review_requests_failed": 0,

@@ -17,6 +17,12 @@ PostgreSQL; the reference -- never a UUID -- resolves the submission);
 fresh drafts of reviewable kinds trigger one idempotent review-request
 queue call. Ordinary reports still create drafts only. This module never
 posts operational data and never writes review tables directly.
+
+Multi-branch senders never get a guessed branch: with more than one
+distinct assignment, a report must open with an explicit
+"<branch>:" prefix naming one assigned branch (case-insensitive);
+otherwise one idempotent branch_clarification row is queued and the event
+stays unmatched. REVIEW commands bypass assignment resolution entirely.
 """
 import re
 import httpx
@@ -33,6 +39,8 @@ _CURRENCY_HINTS = {"ngn": "NGN", "naira": "NGN", "₦": "NGN"}
 _FULL_SALE = re.compile(
     r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)\s+(?:at|for|@)\s+(?P<unit_price>\d+(?:\.\d+)?)")
 _PARTIAL_SALE = re.compile(r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)")
+_BRANCH_PREFIX = re.compile(r"^\s*([^:]{1,64}?)\s*:\s*(.*)$", re.DOTALL)
+CLARIFICATION_MESSAGE_TYPE = "branch_clarification"
 
 
 def _singularize(unit):
@@ -120,6 +128,88 @@ def _distinct_assignments(rows):
     return {(r["business_id"], r["branch_id"]) for r in rows}
 
 
+def _split_branch_prefix(text):
+    """Splits an optional leading "<branch>:" prefix. Returns
+    (prefix, remainder) with both ends stripped; (None, text) when the text
+    opens with no prefix. Never raises on non-text input."""
+    if not isinstance(text, str):
+        return None, None
+    match = _BRANCH_PREFIX.match(text)
+    if match is None:
+        return None, text
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _match_assignment(candidates, prefix):
+    """Resolves a branch prefix to exactly one assigned (business, branch)
+    pair, matching branch ids case-insensitively. Returns None unless the
+    match is unique -- a prefix naming branches in several businesses, or
+    no assigned branch at all, never resolves (no guessing)."""
+    if not prefix:
+        return None
+    wanted = prefix.lower()
+    hits = [pair for pair in candidates if pair[1].lower() == wanted]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _resolve_multi_assignment(candidates, text):
+    """Resolves scope for a sender holding several assignments. Returns
+    ((business_id, branch_id), stripped_text), or None when the message
+    carries no usable explicit prefix (missing, invalid, unassigned,
+    ambiguous, or empty remainder) -- the caller must then clarify, never
+    submit."""
+    prefix, remainder = _split_branch_prefix(text)
+    if not prefix or not remainder:
+        return None
+    match = _match_assignment(candidates, prefix)
+    if match is None:
+        return None
+    return match, remainder
+
+
+def _clarification_text(candidates):
+    """Branch-selection request naming only branches assigned to this
+    sender, upper-cased for readability (matching stays case-insensitive).
+    Deterministic order, length-capped; carries no business data beyond
+    the sender's own branch codes."""
+    options = sorted({branch for _, branch in candidates if branch})
+    shown = ["%s:" % branch.upper() for branch in options]
+    if len(shown) == 2:
+        joined = "%s or %s" % (shown[0], shown[1])
+    elif len(shown) > 2:
+        joined = "%s, or %s" % (", ".join(shown[:-1]), shown[-1])
+    else:
+        joined = "".join(shown)
+    return ("Please begin your message with %s so YAMSI knows which branch "
+        "to use." % joined)[:500]
+
+
+async def _request_branch_selection(client, row, tenant_id, employee_id,
+        sender, candidates, summary):
+    """Queues one idempotent branch_clarification row for an unresolved
+    multi-branch message. Idempotency key is per inbox event, so retries
+    and concurrent double-processing can never queue a second reply. The
+    row carries no business/branch scope (there is none to record)."""
+    key = row["id"] + ":" + CLARIFICATION_MESSAGE_TYPE
+    existing = await _get_json(client, "/rest/v1/biz_outbound_messages",
+        {"idempotency_key": "eq." + key, "select": "id"})
+    if existing:
+        return False
+    response = await client.post("/rest/v1/biz_outbound_messages",
+        params={"on_conflict": "idempotency_key"},
+        headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        json=[{"tenant_id": tenant_id, "business_id": None, "branch_id": None,
+            "recipient_employee_id": employee_id, "provider": "whatsapp",
+            "provider_sender": sender, "provider_account": row.get("provider_account"),
+            "related_task_id": None, "message_type": CLARIFICATION_MESSAGE_TYPE,
+            "message_text": _clarification_text(candidates),
+            "status": "queued", "idempotency_key": key}])
+    if response.status_code not in (200, 201, 204):
+        raise DatabaseUnavailable("Unable to queue branch clarification")
+    summary["clarifications_queued"] += 1
+    return True
+
+
 async def _process_one(client, row, summary):
     inbox_id = row["id"]
     body = row.get("payload") or {}
@@ -170,11 +260,27 @@ async def _process_one(client, row, summary):
     assignments = await _get_json(client, "/rest/v1/biz_assignments",
         {"tenant_id": "eq." + tenant_id, "employee_id": "eq." + employee_id, "select": "business_id,branch_id"})
     candidates = _distinct_assignments(assignments)
-    if len(candidates) != 1:
+    report_text = None
+    if len(candidates) == 1:
+        business_id, branch_id = next(iter(candidates))
+    elif candidates:
+        # Several assignments: only an explicit "<branch>:" prefix naming
+        # exactly one assigned branch selects scope. Anything else is
+        # clarified, never submitted, never guessed.
+        raw_text = (event.get("text") or {}).get("body") \
+            if event.get("type") == "text" else None
+        resolved = _resolve_multi_assignment(candidates, raw_text)
+        if resolved is None:
+            await _request_branch_selection(
+                client, row, tenant_id, employee_id, sender, candidates, summary)
+            await _mark_inbox(client, inbox_id, "unmatched")
+            summary["unmatched"] += 1
+            return
+        (business_id, branch_id), report_text = resolved
+    else:
         await _mark_inbox(client, inbox_id, "unmatched")
         summary["unmatched"] += 1
         return
-    business_id, branch_id = next(iter(candidates))
 
     if event.get("type") == "image":
         result = await evidence_store.handle_incoming_image(
@@ -188,7 +294,8 @@ async def _process_one(client, row, summary):
             summary["images_unlinked"] += 1
         return
 
-    text = event.get("text", {}).get("body") if event.get("type") == "text" else None
+    text = report_text if report_text is not None else (
+        event.get("text", {}).get("body") if event.get("type") == "text" else None)
     extraction = rule_engine.extract(business_id, branch_id, text, received_at=row.get("received_at"))
     submission = {
         "tenant_id": tenant_id, "business_id": business_id, "branch_id": branch_id,
@@ -234,6 +341,7 @@ async def process_inbox_batch(limit=INBOX_BATCH_LIMIT):
     if key.startswith("eyJ"):
         headers["Authorization"] = "Bearer " + key
     summary = {"scanned": 0, "submitted": 0, "unmatched": 0, "skipped_non_message": 0,
+        "clarifications_queued": 0,
         "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
         "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
         "review_requests_queued": 0, "review_requests_failed": 0,
