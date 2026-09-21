@@ -2,7 +2,8 @@ import os
 import secrets
 from pathlib import Path
 from fastapi import FastAPI, Depends, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+import legal_pages
 from calculations import poultry, water, commission
 from supabase_backend import read_businesses, DatabaseUnavailable, TENANT
 from message_processor import process_inbox_batch
@@ -30,6 +31,23 @@ def dashboard():
 @app.get("/health")
 def health():
     return {"status":"ok", "identity":"YAMSI BizLite Brain", "stage":"local foundation"}
+
+@app.get("/privacy", include_in_schema=False)
+def privacy():
+    """Public Privacy Policy for YAMSI Lite (Meta app review). No
+    authentication, no secrets, no personal data -- static HTML only."""
+    return HTMLResponse(legal_pages.PRIVACY_HTML)
+
+@app.get("/terms", include_in_schema=False)
+def terms():
+    """Public Terms of Service for YAMSI Lite. Static HTML only."""
+    return HTMLResponse(legal_pages.TERMS_HTML)
+
+@app.get("/data-deletion", include_in_schema=False)
+def data_deletion():
+    """Public data-deletion instructions for YAMSI Lite. Static HTML
+    only; requests are handled by email, never promised a deadline."""
+    return HTMLResponse(legal_pages.DATA_DELETION_HTML)
 
 @app.get("/business/list", dependencies=[Depends(require_api_key)])
 def businesses():
