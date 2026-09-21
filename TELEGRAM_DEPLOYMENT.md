@@ -176,7 +176,21 @@ triggers. Validate the keys only after reconciliation:
    `biz_provider_accounts` row per tenant/business/branch for
    `('telegram', 'YamsiBizLiteBot')` and for each real WhatsApp
    `phone_number_id`. Never register `controlled-e2e-test` or any
-   other test fixture as a real account.
+   other test fixture as a real account. After migration
+   `20260924000000` (one account may serve many scopes), register the
+   bot for Warri `<TENANT_UUID>` exactly as for Asaba:
+   `insert into public.biz_provider_accounts (tenant_id, business_id,
+   branch_id, provider, provider_account, enabled) values
+   ('<TENANT_UUID>', 'amose_table_water', 'warri', 'telegram',
+   'YamsiBizLiteBot', true) on conflict do nothing;`
+5. Do NOT replay or reprocess the failed Warri inbox row: it holds a
+   test sale and must remain `failed` for audit unless the owner
+   explicitly orders a controlled smoke test. Instead, send a new
+   clearly identified test message (e.g. prefixed `SMOKE-TEST`, zero
+   or obviously-fake amounts) from the Warri assignment and confirm it
+   queues a draft review request. Never approve/post that test
+   transaction as real business data -- reject it after the queueing
+   check succeeds.
 2. Inspect legacy snapshots with counts only -- never select message
    contents, tokens, or secrets:
    `select provider, provider_account, count(*) from

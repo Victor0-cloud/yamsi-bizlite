@@ -24,10 +24,14 @@ def normalize_account(value):
     return value.strip()
 
 
-async def find_account(tenant_id, provider, provider_account):
+async def find_account(tenant_id, provider, provider_account,
+        business_id=None, branch_id=None):
     """Returns the single enabled registry row for an exact
-    (tenant, provider, account) match, or None when the account is
-    unknown, disabled, or the arguments are blank. Never raises for a
+    (tenant, provider, account) match -- further narrowed to one scope
+    when business_id/branch_id are given -- or None when the account is
+    unknown, disabled, ambiguous, or the arguments are blank. One account
+    may serve many scopes, so scoped callers must pass their scope;
+    unscoped callers still require exactly one row. Never raises for a
     missing row (callers fail closed on None); database failures still
     raise DatabaseUnavailable."""
     account = normalize_account(provider_account)
@@ -35,13 +39,18 @@ async def find_account(tenant_id, provider, provider_account):
         return None
     if provider not in SUPPORTED_PROVIDERS or account is None:
         return None
-    rows = await rest_get("/rest/v1/biz_provider_accounts", {
+    params = {
         "tenant_id": "eq." + tenant_id.strip(),
         "provider": "eq." + provider,
         "provider_account": "eq." + account,
         "enabled": "eq.true",
         "select": "tenant_id,business_id,branch_id,provider,"
-            "provider_account,enabled,label"})
+            "provider_account,enabled,label"}
+    if isinstance(business_id, str) and business_id.strip():
+        params["business_id"] = "eq." + business_id.strip()
+    if isinstance(branch_id, str) and branch_id.strip():
+        params["branch_id"] = "eq." + branch_id.strip()
+    rows = await rest_get("/rest/v1/biz_provider_accounts", params)
     if len(rows) != 1:
         return None
     row = rows[0]
@@ -58,8 +67,10 @@ async def find_account(tenant_id, provider, provider_account):
 async def is_account_authorized(tenant_id, business_id, branch_id,
         provider, provider_account):
     """True only when the account is registered AND enabled for exactly
-    this tenant/business/branch. No fallback to another scope, ever."""
-    row = await find_account(tenant_id, provider, provider_account)
+    this tenant/business/branch. The lookup itself is scope-filtered, and
+    the returned row is re-checked -- no fallback to another scope, ever."""
+    row = await find_account(tenant_id, provider, provider_account,
+        business_id, branch_id)
     if row is None:
         return False
     return row.get("business_id") == business_id \
