@@ -66,6 +66,19 @@ secrets only in the private field indicated for each step.
 | `SUPABASE_SECRET_KEY` | `<SERVICE_ROLE_KEY>` (service role, server only) |
 | `YAMSI_API_KEY` | `<OWNER_KEY>` (protects all `/internal/*` routes) |
 
+Optional (compiled defaults apply when unset; set only to override):
+
+| Variable | Value |
+|---|---|
+| `WHATSAPP_ENV` | `production` (default when unset is production; `local`/`test` only for development) |
+| `OUTBOUND_HTTP_TIMEOUT_SECONDS` | e.g. `10` (a number between 1 and 120; default 10) |
+
+Legacy `WEBHOOK_BASE_URL` / `PUBLIC_BASE_URL` still work as a fallback
+but are deprecated: readiness reports them and asks for the canonical
+`WHATSAPP_WEBHOOK_BASE_URL`. Setting both to different values is
+reported as conflicting. A tracked `.env.example` (placeholders only)
+lists every name; real `.env` files stay git-ignored.
+
 Never use test/default credentials: missing values fail closed
 (readiness reports them; sending/handshake refuse). Validate with:
 
@@ -74,16 +87,50 @@ Never use test/default credentials: missing values fail closed
   `x-yamsi-key: <OWNER_KEY>` — per-dimension booleans
   (inbound/outbound/database/live) plus missing-item names. Values never
   appear. Proceed only when `live_ready` is true.
+- `GET /internal/whatsapp/readiness` with header
+  `x-yamsi-key: <OWNER_KEY>` — production-readiness report: overall
+  `ready`, per-dimension status (`database`, `provider`, `webhook`,
+  `outbound_dispatch`), enabled provider-account count for
+  `?tenant_id=<TENANT_UUID>`, plus `missing`, `malformed`,
+  `conflicting`, `warnings`, and safe remediation naming variable names
+  only. No tokens, secrets, phone numbers, or database URLs ever appear.
+  Proceed only when `ready` is true.
 
 ## 5. Supabase migrations
 
-Apply reviewed migrations in order (forward-only; the live database is
-never reset):
+Apply reviewed migrations in exact filename order (forward-only; the
+live database is never reset):
+
+```
+20260918061326_human_confirmation_workflow.sql
+20260918073012_whatsapp_review_integration.sql
+20260918155717_telegram_review_backup.sql
+20260919090000_telegram_naira_format.sql
+20260920000000_daily_business_records.sql
+20260921000000_live_whatsapp_integration.sql
+```
+
+Procedure:
 
 ```
 supabase migration list     # confirm pending set
 supabase db push            # or the hosted-SQL equivalent
 ```
+
+Then verify against a local shadow database (never production data):
+
+```
+supabase db reset --local
+(pipe each file under supabase/probes/ into the local postgres;
+ every file ends in ROLLBACK and a PASSED notice)
+```
+
+Probe files: `daily_business_records_probes.sql`,
+`live_whatsapp_probes.sql` (registry, claim lease, delivery
+monotonicity, branch clarification), `branch_clarification_probes.sql`,
+`production_readiness_probes.sql` (per-tenant enabled-account counts
+behind the readiness endpoint). All probe writes roll back with zero
+residue; a missing PASSED notice is a deployment blocker.
 
 Includes the live-integration migration: `biz_provider_accounts`
 registry, outbound lease/retry/delivery columns, stale-claim recovery
@@ -158,14 +205,34 @@ pay stays a preview until separately confirmed.
 
 ## 10. Safe outbound test
 
+Safe dispatcher invocation rules (every entry point is bounded; no
+polling loop or scheduler exists anywhere):
+
+- Webhook deliveries trigger one background pass of at most 10 rows;
+  dispatch trouble is recorded on the rows and never fails the webhook
+  acknowledgement.
+- Manual backlog drain: `POST /internal/dispatch-outbound`
+  (`{"limit": 5}`) with the owner key. `limit` is clamped to 1..100
+  (default 20). Never wrap this call in a loop or cron without an
+  operator watching the queue -- each pass already claims every due row.
+- Crash recovery is a separate explicit call:
+  `POST /internal/recover-stale-outbound`
+  (`{"stale_seconds": 1800, "limit": 50}`); `stale_seconds` must be
+  60..86400. Recovery is transactional and idempotent; concurrent runs
+  are safe (`SKIP LOCKED`).
+
+Test procedure:
+
 1. Trigger a clarification or review notification (e.g. message from a
    number with two assignments and no branch prefix).
-2. Run one bounded pass: `POST /internal/dispatch-outbound`
-   (`{"limit": 5}`) with the owner key. The conditional claim sends each
-   row at most once; the reply uses the row's own provider account.
+2. Run one bounded pass as above. The conditional claim sends each
+   row at most once; the reply uses the row's own provider account --
+   never another tenant's or branch's number.
 3. A retryable failure (timeout/429/5xx) re-queues with bounded backoff
-   (max 5 attempts); a permanent failure (bad recipient/400) fails
-   terminally without looping.
+   (max 5 attempts, 5min doubling capped at 4h); a permanent failure
+   (bad recipient/400) fails terminally without looping.
+4. Confirm `failure_reason` holds only sanitized `failure=...` codes and
+   the application logs show masked recipients (last four digits only).
 
 ## 11. Delivery-status updates
 
@@ -184,8 +251,34 @@ the outbound test.
   (queued rows stop at claim; drafts unaffected).
 - Stop sending: do not call dispatch; rows stay `queued` (or reclaim
   `sending` leases via `POST /internal/recover-stale-outbound`).
+- Re-verify after any rollback step with
+  `GET /internal/whatsapp/readiness?tenant_id=<TENANT_UUID>`: the
+  affected dimension flips to not-ready with a remediation naming the
+  variable or account to restore.
 - No code rollback path is needed for reads; migrations are
   forward-only -- disabling at Meta/registry is the switch.
+
+## 14. Production smoke-test checklist
+
+Read-only unless marked LIVE. Nothing here creates financial or
+operational records (no fake sales, deposits, or postings).
+
+- [ ] `GET /health` returns ok.
+- [ ] `GET /internal/whatsapp/readiness?tenant_id=<TENANT_UUID>` with
+  the owner key returns `ready: true` and the expected enabled
+  provider-account count.
+- [ ] `GET /internal/provider-accounts?tenant_id=<TENANT_UUID>` lists
+  each live number under its exact business/branch scope.
+- [ ] Meta webhook status shows the callback verified (GET handshake
+  answered the challenge; a wrong token is denied, never echoed).
+- [ ] LIVE inbound: from a registered staff number, send one real
+  report; expect webhook 200, one inbox row, one draft, one review
+  request queued -- and no posting until a human confirms.
+- [ ] LIVE outbound: run one bounded dispatch pass; expect the reply on
+  the row's own number, `delivery_state` progressing
+  sent → delivered → read, and masked recipients in the logs.
+- [ ] Suspected leak or wrong-account drill: rotate the token (step 2)
+  or disable the number (step 12), then re-run readiness to confirm.
 
 ## 13. Incident recovery procedure
 

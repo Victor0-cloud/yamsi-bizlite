@@ -41,6 +41,27 @@ _RECIPIENT_PATTERN = re.compile(r"^[0-9]{5,15}$")
 
 _TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 
+# Optional operator override, validated by production_readiness: a present,
+# in-range OUTBOUND_HTTP_TIMEOUT_SECONDS scales the read/write legs only.
+# Unset or unusable values keep the compiled default above, so existing
+# behavior (and every existing test) is untouched.
+_MIN_TIMEOUT_SECONDS = 1.0
+_MAX_TIMEOUT_SECONDS = 120.0
+
+
+def _timeout():
+    raw = os.environ.get("OUTBOUND_HTTP_TIMEOUT_SECONDS", "")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            seconds = float(raw.strip())
+        except ValueError:
+            seconds = None
+        if seconds is not None \
+                and _MIN_TIMEOUT_SECONDS <= seconds <= _MAX_TIMEOUT_SECONDS:
+            return httpx.Timeout(connect=5.0, read=seconds,
+                write=seconds, pool=5.0)
+    return _TIMEOUT
+
 
 class OutboundUnavailable(Exception):
     """Base class: the send did not happen. See retryable for whether a
@@ -138,7 +159,7 @@ async def send_text_message(phone_number_id, to, body):
     payload = {"messaging_product": "whatsapp", "to": recipient,
         "type": "text", "text": {"body": text}}
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT,
+        async with httpx.AsyncClient(timeout=_timeout(),
                 follow_redirects=False) as client:
             response = await client.post(url, headers=headers, json=payload)
     except httpx.TimeoutException:

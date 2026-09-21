@@ -45,9 +45,11 @@ async def find_account(tenant_id, provider, provider_account):
     if len(rows) != 1:
         return None
     row = rows[0]
-    # Defense in depth: the query already filters enabled, but a disabled
-    # row reaching here (stale cache, permissive mock) must never
-    # authorize -- fail closed.
+    # Defense in depth: the query already filters tenant and enabled, but
+    # a row from another tenant reaching here (stale cache, permissive
+    # caller) must never authorize -- fail closed.
+    if row.get("tenant_id") != tenant_id.strip():
+        return None
     if row.get("enabled") is not True:
         return None
     return row
