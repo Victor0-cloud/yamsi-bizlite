@@ -113,6 +113,22 @@ def whatsapp_readiness():
     return whatsapp_config.check_whatsapp_readiness()
 
 
+@app.get("/internal/whatsapp/readiness", dependencies=[Depends(require_api_key)])
+async def whatsapp_production_readiness(tenant_id: str = ""):
+    """Owner-only production-readiness report for the live WhatsApp
+    integration: overall ready flag, per-dimension status (database,
+    provider, webhook, outbound dispatch), enabled provider-account count
+    for the requested tenant, warnings, and safe remediation naming
+    variable names only. Fully redacted and deterministic -- no tokens,
+    secrets, phone numbers, or database URLs ever appear. Never raises
+    for an unreachable database and never calls Meta, so a transient
+    provider outage cannot break this endpoint. tenant_id is optional;
+    without it the account count is null with a warning."""
+    import production_readiness
+    return await production_readiness.build_readiness_report(
+        tenant_id=tenant_id)
+
+
 @app.get("/internal/provider-accounts", dependencies=[Depends(require_api_key)])
 async def provider_accounts(tenant_id: str = ""):
     """Owner-only visibility over registered provider accounts for one

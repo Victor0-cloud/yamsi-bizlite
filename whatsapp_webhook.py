@@ -8,6 +8,7 @@ import secrets
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from safe_logging import log_event
 from supabase_backend import credentials, DatabaseUnavailable
 
 router = APIRouter()
@@ -18,10 +19,13 @@ _SIGNATURE_PATTERN = re.compile(r"^sha256=[0-9a-f]{64}$")
 async def verify(request: Request):
     expected = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
     if not expected:
+        log_event("webhook_verify_unconfigured")
         raise HTTPException(503, "Webhook verification is not configured")
     params = request.query_params
     supplied = params.get("hub.verify_token", "")
     if params.get("hub.mode") != "subscribe" or not secrets.compare_digest(supplied.encode(), expected.encode()):
+        # The supplied token is never logged -- only the denial fact.
+        log_event("webhook_verify_denied")
         raise HTTPException(403, "Verification denied")
     challenge = params.get("hub.challenge")
     if not challenge or len(challenge) > 1024:
@@ -156,15 +160,24 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
         if len(raw) > MAX_BYTES:
             raise HTTPException(413, "Payload too large")
     if _verified_signature(request, raw) is None:
+        # Neither the signature value nor the secret is logged.
+        log_event("webhook_signature_rejected", bytes=len(raw))
         raise HTTPException(403, "Invalid signature")
     try:
         payload = json.loads(raw)
         rows = extract_events(payload)
     except (ValueError, TypeError, RecursionError):
+        log_event("webhook_payload_malformed", bytes=len(raw))
         raise HTTPException(400, "Malformed webhook payload") from None
+    kinds = {}
+    for row in rows:
+        kind = (row.get("payload") or {}).get("kind", "unknown")
+        kinds[kind] = kinds.get(kind, 0) + 1
     if rows:
         await save_events(rows)
         # Durable insertion above has already succeeded at this point; only
         # now is any further (non-durable, best-effort) work scheduled.
         background_tasks.add_task(_trigger_processing)
+    log_event("webhook_ack", events=len(rows),
+        messages=kinds.get("message", 0), statuses=kinds.get("status", 0))
     return {"received":True,"events":len(rows)}

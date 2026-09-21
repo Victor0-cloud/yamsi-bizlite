@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from safe_logging import log_event
 from supabase_backend import credentials, DatabaseUnavailable, rest_get, rest_patch
 import notifier
 import retry_engine
@@ -138,10 +139,17 @@ async def dispatch_pending(limit=BATCH_LIMIT, now=None):
             await rest_patch("/rest/v1/biz_outbound_messages", {"id": "eq." + claimed["id"]},
                 {"status": "failed", "failure_reason": str(error)[:500]})
             summary["failed"] += 1
+            # Recipient is masked; the failure class (never the token or
+            # body) is safe to record.
+            log_event("outbound_send_error", message_id=claimed["id"],
+                to=claimed.get("provider_sender"),
+                error=type(error).__name__)
             continue
         if result.get("status") == "sent":
             await retry_engine.record_success(claimed["tenant_id"], "outbound_message", claimed["id"])
             summary["sent"] += 1
+            log_event("outbound_sent", message_id=claimed["id"],
+                to=claimed.get("provider_sender"))
             continue
         attempts = _attempt_count(claimed) + 1
         if result.get("retryable") and attempts < OUTBOUND_MAX_ATTEMPTS:
@@ -161,6 +169,13 @@ async def dispatch_pending(limit=BATCH_LIMIT, now=None):
             {"status": "failed", "attempt_count": attempts,
                 "failure_reason": (result.get("failure_reason") or "send failed")[:500]})
         summary["failed"] += 1
+        log_event("outbound_failed_terminal", message_id=claimed["id"],
+            to=claimed.get("provider_sender"),
+            attempts=attempts,
+            reason=(result.get("failure_reason") or "send failed")[:120])
+    log_event("outbound_dispatch_pass", scanned=summary["scanned"],
+        sent=summary["sent"], failed=summary["failed"],
+        claim_conflicts=summary["claim_conflicts"])
     return summary
 
 
