@@ -301,6 +301,74 @@ class ProviderAccountTests(unittest.TestCase):
                     "t", "water", "asaba", "whatsapp", "  ")))
         rget.assert_not_called()
 
+    def test_multibranch_lookup_is_scope_filtered(self):
+        asaba = {"tenant_id": "t", "business_id": "water",
+            "branch_id": "asaba", "provider": "telegram",
+            "provider_account": "bot", "enabled": True}
+        warri = dict(asaba, branch_id="warri")
+        seen = {}
+
+        async def fake_get(path, params=None):
+            seen.update(params)
+            if params.get("branch_id") == "eq.warri":
+                return [warri]
+            return [asaba]
+
+        with patch("provider_accounts.rest_get",
+                   new_callable=AsyncMock, side_effect=fake_get):
+            self.assertTrue(asyncio.run(
+                provider_accounts.is_account_authorized(
+                    "t", "water", "warri", "telegram", "bot")))
+        self.assertEqual(seen.get("business_id"), "eq.water")
+        self.assertEqual(seen.get("branch_id"), "eq.warri")
+        self.assertEqual(seen.get("provider_account"), "eq.bot")
+
+    def test_same_account_serves_two_branches_without_crosstalk(self):
+        asaba = {"tenant_id": "t", "business_id": "water",
+            "branch_id": "asaba", "provider": "telegram",
+            "provider_account": "bot", "enabled": True}
+        warri = dict(asaba, branch_id="warri")
+
+        async def fake_get(path, params=None):
+            if params.get("branch_id") == "eq.warri":
+                return [warri]
+            return [asaba]
+
+        with patch("provider_accounts.rest_get",
+                   new_callable=AsyncMock, side_effect=fake_get):
+            self.assertTrue(asyncio.run(
+                provider_accounts.is_account_authorized(
+                    "t", "water", "warri", "telegram", "bot")))
+            self.assertTrue(asyncio.run(
+                provider_accounts.is_account_authorized(
+                    "t", "water", "asaba", "telegram", "bot")))
+            self.assertFalse(asyncio.run(
+                provider_accounts.is_account_authorized(
+                    "t", "water", "north", "telegram", "bot")))
+
+    def test_unscoped_ambiguous_account_fails_closed(self):
+        rows = [
+            {"tenant_id": "t", "business_id": "water",
+             "branch_id": "asaba", "provider": "telegram",
+             "provider_account": "bot", "enabled": True},
+            {"tenant_id": "t", "business_id": "water",
+             "branch_id": "warri", "provider": "telegram",
+             "provider_account": "bot", "enabled": True}]
+        with patch("provider_accounts.rest_get", new_callable=AsyncMock,
+                   return_value=rows):
+            self.assertIsNone(asyncio.run(
+                provider_accounts.find_account("t", "telegram", "bot")))
+
+    def test_disabled_branch_row_fails_closed(self):
+        row = {"tenant_id": "t", "business_id": "water",
+            "branch_id": "warri", "provider": "telegram",
+            "provider_account": "bot", "enabled": False}
+        with patch("provider_accounts.rest_get", new_callable=AsyncMock,
+                   return_value=[row]):
+            self.assertFalse(asyncio.run(
+                provider_accounts.is_account_authorized(
+                    "t", "water", "warri", "telegram", "bot")))
+
     def test_submission_carries_route_snapshot(self):
         client = AsyncMock()
 
@@ -1102,6 +1170,66 @@ class ProviderAccountConstraintTests(unittest.TestCase):
                     text = handle.read()
                 self.assertNotIn("provider_account_fk", text)
                 self.assertNotIn("validate constraint", text.lower())
+
+
+# ---------------------------------------------------------------------------
+# 14. Multi-branch provider accounts: one account may serve many scopes.
+# ---------------------------------------------------------------------------
+
+
+class MultibranchMigrationTests(unittest.TestCase):
+    PATH = "supabase/migrations/20260924000000_multibranch_provider_accounts.sql"
+    TENANT_KEY = ("biz_provider_accounts_tenant_id_provider_"
+        "provider_account_key")
+
+    @classmethod
+    def _migration(cls, name=None):
+        # PATH is already the complete repository-relative path; an
+        # explicit name must be complete too (never prepended twice).
+        with open(name or cls.PATH, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_drops_only_tenant_wide_uniqueness(self):
+        import re
+        text = self._migration()
+        drops = re.findall(
+            r"drop constraint if exists\s+(\w+)", text.lower())
+        self.assertEqual(drops, [self.TENANT_KEY])
+
+    def test_scoped_uniqueness_survives(self):
+        old = self._migration(
+            "supabase/migrations/"
+            "20260921000000_live_whatsapp_integration.sql")
+        self.assertIn(
+            "unique (tenant_id, business_id, branch_id, provider,"
+            " provider_account)",
+            old)
+        drops = " ".join(
+            line for line in self._migration().lower().splitlines()
+            if "drop constraint" in line)
+        self.assertNotIn("business_id", drops)
+
+    def test_tenant_helper_uses_existence_semantics(self):
+        text = self._migration()
+        start = text.index(
+            "create or replace function public."
+            "_amose_provider_tenant_authorized(")
+        body = text[start:text.index("$func$;", start)]
+        self.assertIn("select exists (", body)
+        self.assertIn("a.enabled = true", body)
+        self.assertIn("security definer", text[start:start + 400])
+        self.assertIn("revoke execute on function public."
+            "_amose_provider_tenant_authorized(uuid, text, text)",
+            text)
+
+    def test_migration_preserves_rows_and_keys(self):
+        lowered = self._migration().lower()
+        self.assertNotRegex(lowered, r"(?m)^\s*delete\s+from\s")
+        self.assertNotIn("truncate", lowered)
+        self.assertNotIn("insert into public.biz_provider_accounts",
+            lowered)
+        self.assertNotIn("validate constraint", lowered)
+        self.assertNotIn("provider_account_fk", lowered)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@
 --   (pipe this file into the local postgres, then roll back)
 --
 -- Proves, with throwaway fixtures only:
---   R1. one account maps to exactly one scope (second scope rejected);
+--   R1. one account may serve many scopes (second scope accepted,
+--       exact duplicate scope rejected);
 --   R2. a submission with an unregistered account is rejected;
 --   R3. a submission with a disabled account is rejected;
 --   R4. a submission with no route snapshot is accepted (legacy/API rows);
@@ -61,19 +62,33 @@ insert into public.biz_provider_accounts
   ('00000000-0000-0000-0000-00000000e101', 'probe-water', 'main', 'whatsapp',
    'acct-live-1', true, 'Main line'),
   ('00000000-0000-0000-0000-00000000e101', 'probe-water', 'main', 'whatsapp',
-   'acct-old-9', false, 'Retired line');
+   'acct-old-9', false, 'Retired line'),
+  ('00000000-0000-0000-0000-00000000e101', 'probe-water', 'main', 'whatsapp',
+   'acct-main-only', true, 'Main-only line');
 
--- R1. The same account cannot authorize a second scope.
+-- R1. The same account may serve a second scope (one row per scope);
+-- an exact duplicate scope is still rejected. The north row stays for
+-- the probes below, so the tenant-level helper below also proves
+-- multi-row existence semantics.
 do $$
 begin
   insert into public.biz_provider_accounts
     (tenant_id, business_id, branch_id, provider, provider_account, enabled) values
     ('00000000-0000-0000-0000-00000000e101', 'probe-water', 'north', 'whatsapp',
      'acct-live-1', true);
-  raise exception 'R1: cross-scope duplicate account was accepted';
+exception when others then
+  raise exception 'R1a: cross-scope account was refused: %', sqlerrm;
+end $$;
+do $$
+begin
+  insert into public.biz_provider_accounts
+    (tenant_id, business_id, branch_id, provider, provider_account, enabled) values
+    ('00000000-0000-0000-0000-00000000e101', 'probe-water', 'main', 'whatsapp',
+     'acct-live-1', true);
+  raise exception 'R1b: exact duplicate scope was accepted';
 exception when unique_violation then
   if sqlerrm not like '%biz_provider_accounts%' then
-    raise exception 'R1: wrong unique violation: %', sqlerrm;
+    raise exception 'R1b: wrong unique violation: %', sqlerrm;
   end if;
 end $$;
 
@@ -129,7 +144,9 @@ insert into public.biz_submissions
    '00000000-0000-0000-0000-00000000e102',
    'probe:r4b', 'sale', '{"parsed": {}}', 'draft', 'whatsapp', 'acct-live-1');
 
--- R5. Submission binding the account to another branch is rejected.
+-- R5. Submission binding a main-only account to another branch is
+-- rejected (acct-live-1 now legitimately serves north too, so a
+-- main-only account proves misbinding still fails closed).
 do $$
 begin
   insert into public.biz_submissions
@@ -138,10 +155,10 @@ begin
     ('00000000-0000-0000-0000-00000000e101', 'probe-water', 'north',
      '00000000-0000-0000-0000-00000000e115',
      '00000000-0000-0000-0000-00000000e102',
-     'probe:r5', 'sale', '{"parsed": {}}', 'draft', 'whatsapp', 'acct-live-1');
+     'probe:r5', 'sale', '{"parsed": {}}', 'draft', 'whatsapp', 'acct-main-only');
   raise exception 'R5: cross-scope account was accepted';
 exception when others then
-  if sqlerrm not like '%acct-live-1%' and sqlerrm not like '%provider account%' then
+  if sqlerrm not like '%acct-main-only%' and sqlerrm not like '%provider account%' then
     raise exception 'R5: wrong error: %', sqlerrm;
   end if;
 end $$;
