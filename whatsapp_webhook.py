@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -11,6 +12,7 @@ from supabase_backend import credentials, DatabaseUnavailable
 
 router = APIRouter()
 MAX_BYTES = 1024 * 1024
+_SIGNATURE_PATTERN = re.compile(r"^sha256=[0-9a-f]{64}$")
 
 @router.get("/webhooks/whatsapp")
 async def verify(request: Request):
@@ -123,19 +125,37 @@ async def _trigger_processing():
         pass
     await _trigger_dispatch()
 
-@router.post("/webhooks/whatsapp")
-async def receive(request: Request, background_tasks: BackgroundTasks):
+def _verified_signature(request, raw):
+    """Validates the x-hub-signature-256 header against the exact raw
+    request bytes. Exactly one well-formed signature value must be
+    present; missing, malformed, or multiple/ambiguous values are all
+    refused without revealing which check fired. Returns None when the
+    signature is absent or invalid, the expected digest otherwise."""
     secret = os.environ.get("WHATSAPP_APP_SECRET", "")
     if not secret:
+        return None
+    supplied_values = request.headers.getlist("x-hub-signature-256")
+    if len(supplied_values) != 1:
+        return None
+    supplied = supplied_values[0]
+    if not _SIGNATURE_PATTERN.match(supplied):
+        return None
+    expected = "sha256=" + hmac.new(secret.encode(), bytes(raw), hashlib.sha256).hexdigest()
+    if not secrets.compare_digest(supplied.encode(), expected.encode()):
+        return None
+    return expected
+
+
+@router.post("/webhooks/whatsapp")
+async def receive(request: Request, background_tasks: BackgroundTasks):
+    if not os.environ.get("WHATSAPP_APP_SECRET", ""):
         raise HTTPException(503, "Webhook authenticity validation is not configured")
     raw = bytearray()
     async for chunk in request.stream():
         raw.extend(chunk)
         if len(raw) > MAX_BYTES:
             raise HTTPException(413, "Payload too large")
-    expected = "sha256=" + hmac.new(secret.encode(), bytes(raw), hashlib.sha256).hexdigest()
-    supplied = request.headers.get("x-hub-signature-256", "")
-    if not secrets.compare_digest(supplied.encode(), expected.encode()):
+    if _verified_signature(request, raw) is None:
         raise HTTPException(403, "Invalid signature")
     try:
         payload = json.loads(raw)
