@@ -199,9 +199,11 @@ pay stays a preview until separately confirmed.
    provider event id stored once -- resends deduplicate), one **draft**
    submission, one review request queued. No financial or operational
    record is created (raw messages create drafts only).
-3. Confirm via `REVIEW CONFIRM <YR-REF> KEY <unique-key>` (sale) or API
-   review (other kinds) → exactly one atomic posting → confirmation ack
-   queued to the original sender on the original provider account.
+3. Confirm via `REVIEW CONFIRM <YR-REF> KEY <unique-key>` (every kind;
+   the verified block is built inside the database, with `CORRECTION`
+   reasons and `REVIEW REJECT ... REASON ...` for correct/cancel) →
+   exactly one atomic posting → confirmation ack queued to the original
+   sender on the original provider account.
 
 ## 10. Safe outbound test
 

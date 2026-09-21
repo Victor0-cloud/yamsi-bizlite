@@ -31,6 +31,9 @@ Submission-kind mapping (explicit; must stay in sync with the migration):
     'expense'                expense        amose_confirm_submission
     'cash_handover'          cash_handover  amose_confirm_submission
     'bank_deposit'           bank_deposit   amose_confirm_submission
+    'stock'                  stock          amose_confirm_submission
+    'customer_payment'       customer_payment amose_confirm_submission
+    'customer_debt'          customer_debt  amose_confirm_submission
     anything else            --             rejected, no RPC call
 
 Safety properties (enforced, tested in test_human_confirmation.py):
@@ -84,13 +87,15 @@ from supabase_backend import credentials, DatabaseUnavailable
 CONFIRM_RPC = "amose_confirm_submission"
 REJECT_RPC = "amose_reject_submission"
 ISSUE_RPC = "amose_issue_review_reference"
+CANCEL_RPC = "amose_cancel_submission"
 
 # Each entry point may call exactly one RPC. Kept as separate singletons so
-# a confirmation can never reach the rejection or issuance RPC and vice
-# versa.
+# a confirmation can never reach the rejection, cancellation, or issuance
+# RPC and vice versa.
 CONFIRM_ALLOWLIST = frozenset({CONFIRM_RPC})
 REJECT_ALLOWLIST = frozenset({REJECT_RPC})
 ISSUE_ALLOWLIST = frozenset({ISSUE_RPC})
+CANCEL_ALLOWLIST = frozenset({CANCEL_RPC})
 
 # Opaque review reference: YR- plus 10 characters from the unambiguous
 # uppercase alphabet (no 0/O, 1/I/L). Mirrors the migration's CHECK.
@@ -106,6 +111,9 @@ KIND_TO_POSTING = {
     "expense": "expense",
     "cash_handover": "cash_handover",
     "bank_deposit": "bank_deposit",
+    "stock": "stock",
+    "customer_payment": "customer_payment",
+    "customer_debt": "customer_debt",
 }
 
 # posting type -> RPC result IDs that must be present, non-empty strings.
@@ -116,6 +124,10 @@ REQUIRED_RESULT_IDS = {
     "expense": ("expense_id", "brain_memory_id"),
     "cash_handover": ("cash_custody_entry_id", "brain_memory_id"),
     "bank_deposit": ("cash_custody_entry_id", "brain_memory_id"),
+    "stock": ("stock_count_id", "brain_memory_id"),
+    "customer_payment": ("customer_payment_id", "cash_custody_entry_id",
+        "brain_memory_id"),
+    "customer_debt": ("customer_debt_id", "brain_memory_id"),
 }
 
 VALID_REVIEW_ACTIONS = frozenset({"confirmed", "corrected"})
@@ -458,6 +470,65 @@ def _validate_bank_deposit(verified, errors):
         if _is_strict_int(verified.get("amount_kobo")) else None}
 
 
+def _validate_stock(verified, errors):
+    _require_uuid(errors, verified.get("product_id"), "product_id")
+    _require_int(errors, verified.get("normal_quantity"),
+        "normal_quantity", minimum=0)
+    _require_int(errors, verified.get("cold_quantity"),
+        "cold_quantity", minimum=0)
+    if "counted_at" in verified:
+        _optional_timestamp(errors, verified.get("counted_at"), "counted_at")
+    for field in ("counted_by", "recorded_by"):
+        if field in verified:
+            _optional_uuid(errors, verified.get(field), field)
+    return {"normal_quantity": verified.get("normal_quantity")
+        if _is_strict_int(verified.get("normal_quantity")) else None,
+        "cold_quantity": verified.get("cold_quantity")
+        if _is_strict_int(verified.get("cold_quantity")) else None}
+
+
+def _validate_customer_reference(verified, errors):
+    """Customer travels as an authoritative UUID when the reviewer knows
+    it, or as the staff-written name the database resolves. At least one
+    must be present; the name is never coerced into an ID here."""
+    if verified.get("customer_id") not in (None, ""):
+        _require_uuid(errors, verified.get("customer_id"), "customer_id")
+    elif not isinstance(verified.get("customer_name"), str) \
+            or not verified.get("customer_name").strip():
+        errors.append("customer_id or customer_name is required")
+    elif len(verified["customer_name"].strip()) > 120:
+        errors.append("customer_name is too long")
+
+
+def _validate_customer_payment(verified, errors):
+    _validate_customer_reference(verified, errors)
+    _require_int(errors, verified.get("amount_kobo"), "amount_kobo", minimum=1)
+    if verified.get("method") not in PAYMENT_METHODS:
+        errors.append("method must be one of %s"
+            % (sorted(PAYMENT_METHODS),))
+    if "received_by" in verified:
+        _optional_uuid(errors, verified.get("received_by"), "received_by")
+    if "paid_at" in verified:
+        _optional_timestamp(errors, verified.get("paid_at"), "paid_at")
+    if "reference" in verified and verified.get("reference") is not None:
+        reference = verified.get("reference")
+        if not isinstance(reference, str) or len(reference.strip()) > 200:
+            errors.append("reference must be a short string")
+    return {"amount_kobo": verified.get("amount_kobo")
+        if _is_strict_int(verified.get("amount_kobo")) else None}
+
+
+def _validate_customer_debt(verified, errors):
+    _validate_customer_reference(verified, errors)
+    _require_int(errors, verified.get("amount_kobo"), "amount_kobo", minimum=1)
+    if "incurred_at" in verified:
+        _optional_timestamp(errors, verified.get("incurred_at"), "incurred_at")
+    if "recorded_by" in verified:
+        _optional_uuid(errors, verified.get("recorded_by"), "recorded_by")
+    return {"amount_kobo": verified.get("amount_kobo")
+        if _is_strict_int(verified.get("amount_kobo")) else None}
+
+
 def validate_verified(kind, verified):
     """Pure preview validation for one verified snapshot. Returns
     {"kind", "posting_type", "verified" (normalized copy), "computed"} or
@@ -488,6 +559,12 @@ def validate_verified(kind, verified):
         computed = _validate_cash_handover(normalized, errors)
     elif posting_type == "bank_deposit":
         computed = _validate_bank_deposit(normalized, errors)
+    elif posting_type == "stock":
+        computed = _validate_stock(normalized, errors)
+    elif posting_type == "customer_payment":
+        computed = _validate_customer_payment(normalized, errors)
+    elif posting_type == "customer_debt":
+        computed = _validate_customer_debt(normalized, errors)
     else:  # Unreachable: posting_for_kind already allowlisted the kind.
         raise UnsupportedKindError("Unsupported submission kind: %r" % (kind,))
     if errors:
@@ -875,6 +952,62 @@ _REVIEW_REJECT = re.compile(
     r"\s+REASON\s+(?P<reason>.+?)\s*$", re.IGNORECASE)
 
 
+_CORRECTION_PAIR = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]{0,39})=(?:\"([^\"]*)\"|'([^']*)'|(\S+))$")
+_CORRECTION_TOKEN = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]{0,39}=\"[^\"]*\""
+    r"|[A-Za-z_][A-Za-z0-9_]{0,39}='[^']*'"
+    r'|"[^"]*"|\'[^\']*\'|\S+')
+_CANCEL_COMMAND = re.compile(
+    r"^CANCEL\s+(?P<ref>YR-[A-Za-z0-9]{10})(?:\s+(?P<reason>.+))?\s*$",
+    re.IGNORECASE)
+
+
+def _split_correction(rest):
+    """Splits CORRECTION text into ({field: value}, reason-or-None).
+
+    field=value tokens (quote-aware, so customer="Emeka Okafor" stays one
+    value) become real value corrections applied before posting; every
+    other word, plus any text after a `--` separator, stays the free-text
+    audit reason. Returns None when a value is blank or overlong -- the
+    whole command is then malformed and refused, never half-applied."""
+    if rest is None:
+        return {}, None
+    zone, sep, after = rest.partition("--")
+    reason_words = []
+    if sep:
+        tail = after.strip()
+        reason_words.append(tail)
+        rest_zone = zone
+    else:
+        rest_zone = rest
+    corrections = {}
+    for match in _CORRECTION_TOKEN.finditer(rest_zone):
+        token = match.group(0)
+        pair = _CORRECTION_PAIR.match(token)
+        if pair:
+            value = next(
+                part for part in pair.groups()[1:] if part is not None)
+            value = value.strip()
+            if not value or len(value) > 200:
+                return None
+            if len(corrections) >= 20:
+                return None
+            corrections[pair.group(1)] = value
+        elif "=" in token or sep:
+            # A token claiming the k=v shape that is not a valid pair
+            # (blank value, bad key), and any non-pair inside a `--`
+            # corrections zone, is malformed rather than silently
+            # reasoned: a typo must never become an audit note.
+            return None
+        else:
+            reason_words.append(token)
+    reason = " ".join(word for word in reason_words if word).strip()
+    if len(reason) > 2000:
+        return None
+    return corrections, (reason or None)
+
+
 def parse_review_command(text):
     """Parses an explicit review command, or returns None for anything else
     (ordinary reports, casual acknowledgements, UUID-carrying commands,
@@ -882,8 +1015,13 @@ def parse_review_command(text):
 
     Grammar (case-insensitive keywords, exact order, review reference only):
       REVIEW CONFIRM <YR-XXXXXXXXXX> KEY <request-key>
-        [CORRECTION <reason>]
+        [CORRECTION [field=value ...] [--] [reason]]
       REVIEW REJECT <YR-XXXXXXXXXX> KEY <request-key> REASON <reason>
+
+    CORRECTION field=value pairs are real value corrections applied to the
+    draft before posting (unknown fields fail closed in the database);
+    remaining words stay the free-text audit reason. Multi-word values
+    need quotes (customer="Emeka Okafor") or a `--` reason separator.
 
     The reference body must use the unambiguous alphabet (no 0/O, 1/I/L);
     anything else -- including a submission UUID in the reference slot --
@@ -896,15 +1034,20 @@ def parse_review_command(text):
         ref = match.group("ref").upper()
         if not REVIEW_REF_PATTERN.match(ref):
             return None
-        reason = match.group("reason")
-        if reason is not None:
-            reason = reason.strip()
-            if not reason or len(reason) > 2000:
+        raw_reason = match.group("reason")
+        if raw_reason is not None:
+            raw_reason = raw_reason.strip()
+            if not raw_reason or len(raw_reason) > 2000:
                 return None
+        split = _split_correction(raw_reason)
+        if split is None:
+            return None
+        corrections, reason = split
         return {"action": "confirm",
             "review_ref": ref,
             "request_key": match.group("key"),
-            "reason": reason}
+            "reason": reason,
+            "corrections": corrections}
     match = _REVIEW_REJECT.match(text.strip())
     if match:
         ref = match.group("ref").upper()
@@ -918,3 +1061,71 @@ def parse_review_command(text):
             "request_key": match.group("key"),
             "reason": reason}
     return None
+
+
+def parse_cancel_command(text):
+    """Parses a submitter cancellation command, or returns None.
+
+    Grammar (case-insensitive keyword, review reference only):
+      CANCEL <YR-XXXXXXXXXX> [reason]
+
+    Only the linked reporter can cancel, and only their own pending
+    draft -- enforced inside the database, never here. The reference
+    body must use the unambiguous alphabet; anything else never parses.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _CANCEL_COMMAND.match(text.strip())
+    if not match:
+        return None
+    ref = match.group("ref").upper()
+    if not REVIEW_REF_PATTERN.match(ref):
+        return None
+    reason = match.group("reason")
+    if reason is not None:
+        reason = reason.strip()
+        if len(reason) > 2000:
+            return None
+        reason = reason or None
+    return {"action": "cancel",
+        "review_ref": ref,
+        "reason": reason}
+
+
+def _validate_cancel_result(result, review_ref, request_key, reason_sent):
+    """Rejects malformed cancel responses: wrong shape, unexpected status
+    or action, unmapped submission kind, or mismatched echoed
+    reference/key/reason. Cancellation posts nothing, so no operational
+    IDs are required -- only the audit ID proving the withdrawal."""
+    if not isinstance(result, dict):
+        raise WorkflowDatabaseError(
+            "Review RPC returned a non-object result")
+    if result.get("status") != "cancelled":
+        raise WorkflowDatabaseError(
+            "Review RPC returned unexpected status: %r" % (result.get("status"),))
+    if result.get("review_action") != "cancelled":
+        raise WorkflowDatabaseError(
+            "Review RPC returned unexpected action: %r"
+            % (result.get("review_action"),))
+    if result.get("submission_kind") not in KIND_TO_POSTING:
+        raise WorkflowDatabaseError(
+            "Review RPC returned an unmapped submission kind: %r"
+            % (result.get("submission_kind"),))
+    try:
+        uuid_module.UUID(result.get("submission_id"))
+    except (ValueError, AttributeError, TypeError):
+        raise WorkflowDatabaseError(
+            "Review RPC returned a malformed submission ID")
+    if result.get("review_ref") != review_ref:
+        raise WorkflowDatabaseError(
+            "Review RPC returned a different review reference")
+    if result.get("request_key") != request_key:
+        raise WorkflowDatabaseError(
+            "Review RPC returned a different request key")
+    if result.get("reason") != reason_sent:
+        raise WorkflowDatabaseError(
+            "Review RPC returned a different cancellation reason")
+    audit_id = result.get("audit_id")
+    if not isinstance(audit_id, str) or not audit_id:
+        raise WorkflowDatabaseError(
+            "Review RPC result is missing the audit ID")

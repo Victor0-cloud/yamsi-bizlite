@@ -68,7 +68,9 @@ from human_confirmation import (
     _require_review_ref,
     _require_sender,
     _require_uuid_arg,
+    _validate_cancel_result,
     _validate_reject_result,
+    parse_cancel_command,
     parse_review_command,
 )
 
@@ -77,15 +79,19 @@ REVOKE_RPC = "amose_revoke_reviewer"
 LIST_RPC = "amose_list_reviewer_authorizations"
 QUEUE_RPC = "amose_queue_review_requests"
 CMD_CONFIRM_RPC = "amose_review_confirm_command"
+CANCEL_RPC = "amose_cancel_submission"
 
 # Each entry point may call exactly one RPC. Rejections reuse the Phase 3
-# reject RPC (reason travels inline, no new surface needed).
+# reject RPC (reason travels inline, no new surface needed); submitter
+# cancellations use the dedicated cancel RPC (reporter-only, terminal
+# status, never a posting).
 GRANT_ALLOWLIST = frozenset({GRANT_RPC})
 REVOKE_ALLOWLIST = frozenset({REVOKE_RPC})
 LIST_ALLOWLIST = frozenset({LIST_RPC})
 QUEUE_ALLOWLIST = frozenset({QUEUE_RPC})
 CMD_CONFIRM_ALLOWLIST = frozenset({CMD_CONFIRM_RPC})
 CMD_REJECT_ALLOWLIST = frozenset({human_confirmation.REJECT_RPC})
+CANCEL_ALLOWLIST = frozenset({CANCEL_RPC})
 
 # Submission kinds that require human review (mirrors the Phase 3 mapping).
 REVIEWABLE_KINDS = frozenset(human_confirmation.KIND_TO_POSTING)
@@ -502,25 +508,71 @@ async def queue_review_requests(client, submission_id, request_key):
     return result
 
 
+def _require_corrections(value):
+    """Validates a parsed corrections mapping: plain string field/value
+    pairs only (the database allowlists per-kind fields and fails closed
+    on anything unknown)."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ReviewValidationError("Corrections must be field=value pairs")
+    if len(value) > 20:
+        raise ReviewValidationError("Too many corrections")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip() \
+                or len(key.strip()) > 40:
+            raise ReviewValidationError("Correction field names are invalid")
+        if not isinstance(item, str) or not item.strip() \
+                or len(item.strip()) > 200:
+            raise ReviewValidationError(
+                "Correction values must be short strings")
+    return {key.strip(): item.strip() for key, item in value.items()}
+
+
 async def confirm_from_chat(client, review_ref, reviewer_provider,
-        reviewer_sender, request_key, correction_reason=None):
+        reviewer_sender, request_key, correction_reason=None,
+        corrections=None):
     """Runs a strict REVIEW CONFIRM command through exactly one atomic RPC.
     The verified block is built inside the database from the submission's
-    own parsed extraction -- never supplied, and never suppliable, here."""
+    own parsed extraction -- never supplied, and never suppliable, here.
+    CORRECTION field=value pairs are real value overrides applied to the
+    draft before posting (unknown fields fail closed in the database)."""
     clean_ref = _require_review_ref(review_ref)
     _require_sender(reviewer_provider, reviewer_sender)
     _require_request_key(request_key)
     reason = None
     if correction_reason is not None:
         reason = _require_reason(correction_reason, "correction reason")
+    clean_corrections = _require_corrections(corrections)
     payload = {"p_review_ref": clean_ref,
         "p_reviewer_provider": reviewer_provider,
         "p_reviewer_sender": reviewer_sender.strip(),
         "p_request_key": request_key,
-        "p_correction_reason": reason}
+        "p_correction_reason": reason,
+        "p_corrections": clean_corrections}
     result = await _post_rpc(
         client, CMD_CONFIRM_RPC, CMD_CONFIRM_ALLOWLIST, payload)
     _validate_command_confirm_result(result, clean_ref, request_key)
+    return result
+
+
+async def cancel_from_chat(client, review_ref, requester_provider,
+        requester_sender, request_key, reason=None):
+    """Runs a submitter CANCEL command through exactly one atomic RPC.
+    Only the linked reporter can withdraw their own pending draft; the
+    database refuses anyone else. Cancellation posts nothing."""
+    clean_ref = _require_review_ref(review_ref)
+    _require_sender(requester_provider, requester_sender)
+    _require_request_key(request_key)
+    clean_reason = _require_reason(reason, "cancellation reason") \
+        if reason is not None else None
+    payload = {"p_review_ref": clean_ref,
+        "p_requester_provider": requester_provider,
+        "p_requester_sender": requester_sender.strip(),
+        "p_request_key": request_key,
+        "p_reason": clean_reason}
+    result = await _post_rpc(client, CANCEL_RPC, CANCEL_ALLOWLIST, payload)
+    _validate_cancel_result(result, clean_ref, request_key, clean_reason)
     return result
 
 
@@ -587,7 +639,8 @@ async def handle_review_command(client, row, sender, command, summary):
             result = await confirm_from_chat(
                 client, command.get("review_ref"), provider, sender,
                 command.get("request_key"),
-                correction_reason=command.get("reason"))
+                correction_reason=command.get("reason"),
+                corrections=command.get("corrections"))
             summary["reviews_confirmed"] += 1
         elif action == "reject":
             result = await reject_from_chat(
