@@ -163,6 +163,36 @@ Bot username: `@YamsiBizLiteBot` (public address, not a secret).
 5. If Telegram delivery is down, WhatsApp review is unaffected, and
    vice versa: each channel queues and sends independently.
 
+## Legacy history reconciliation and constraint validation
+
+The provider-account foreign keys are deployed `NOT VALID`: historical
+rows whose snapshots predate the registry (real sent Telegram history
+using `YamsiBizLiteBot`, queued WhatsApp branch-clarification rows, old
+`controlled-e2e-test` rows) are preserved untouched, while every new
+insert/update is enforced immediately by the keys plus the BEFORE
+triggers. Validate the keys only after reconciliation:
+
+1. Register the real accounts (service role, private session): one
+   `biz_provider_accounts` row per tenant/business/branch for
+   `('telegram', 'YamsiBizLiteBot')` and for each real WhatsApp
+   `phone_number_id`. Never register `controlled-e2e-test` or any
+   other test fixture as a real account.
+2. Inspect legacy snapshots with counts only -- never select message
+   contents, tokens, or secrets:
+   `select provider, provider_account, count(*) from
+   public.biz_submissions where provider_account is not null group by
+   1, 2;` and the same on `public.biz_outbound_messages`.
+3. Reconcile: every distinct real snapshot must now resolve to a
+   registered, enabled account for its exact scope. Re-run the two
+   unmatched-row counts from migration `20260921000000` section 2.
+4. Run `VALIDATE CONSTRAINT` on
+   `biz_submissions_provider_account_fk` and
+   `biz_outbound_provider_account_fk` only when both unmatched counts
+   are zero. If unregistrable fixture rows (e.g. `controlled-e2e-test`)
+   keep a count above zero, do NOT validate and do NOT touch those
+   rows: leaving a key `NOT VALID` is the safe steady state -- new
+   writes stay fully enforced while history is preserved.
+
 ## Privilege matrix (this phase; earlier posture unchanged)
 
 - `biz_telegram_links` / `biz_telegram_callbacks`: RLS ON, no policies;

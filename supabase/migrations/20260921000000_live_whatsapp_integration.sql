@@ -28,6 +28,13 @@
 --          account to be still enabled under the same rule that gated
 --          the insert; disabled or unknown accounts can neither queue
 --          nor send (fully snapshot-less legacy rows skip the check).
+--      Both foreign keys are created NOT VALID: historical rows whose
+--      snapshots predate the registry stay untouched and undeleted, while
+--      every new insert/update is enforced immediately together with the
+--      BEFORE triggers. After deployment, register the real WhatsApp and
+--      Telegram accounts through the service role, reconcile historical
+--      snapshots, then run VALIDATE CONSTRAINT on both keys (see the
+--      reconciliation block in section 2 and the deployment runbooks).
 --      A Meta signature proves the app sent the request; only this
 --      registry authorizes which phone_number_id may act for a scope.
 --   2. Delivery state had no safe representation: the queue-processing
@@ -90,6 +97,19 @@ grant select, insert, update on public.biz_provider_accounts to service_role;
 -- 2. Route snapshots on submissions and outbound rows, bound to the
 -- registry. NULL snapshots skip enforcement (API-created or legacy rows
 -- with no route); any present snapshot must match its exact scope.
+--
+-- Both foreign keys below are created NOT VALID. Production already holds
+-- historical rows whose provider-account snapshots are not yet registered
+-- in biz_provider_accounts (real sent Telegram history, queued WhatsApp
+-- branch-clarification rows, old controlled-e2e-test rows), and a
+-- validating constraint would fail the deployment instead of preserving
+-- that history. NOT VALID skips the initial table scan only: every new
+-- INSERT and every UPDATE of a constrained column is still checked
+-- immediately, and the BEFORE triggers in sections below keep failing
+-- closed on unregistered or disabled accounts from the first row.
+-- Validate both constraints only after the post-deployment reconciliation
+-- in WHATSAPP_DEPLOYMENT.md / TELEGRAM_DEPLOYMENT.md proves no unmatched
+-- historical routed row remains.
 -- ---------------------------------------------------------------------------
 alter table public.biz_submissions
   add column if not exists provider text;
@@ -102,7 +122,8 @@ alter table public.biz_submissions
   add constraint biz_submissions_provider_account_fk
   foreign key (tenant_id, business_id, branch_id, provider, provider_account)
   references public.biz_provider_accounts
-    (tenant_id, business_id, branch_id, provider, provider_account);
+    (tenant_id, business_id, branch_id, provider, provider_account)
+  not valid;
 
 alter table public.biz_outbound_messages
   drop constraint if exists biz_outbound_provider_account_fk;
@@ -110,7 +131,42 @@ alter table public.biz_outbound_messages
   add constraint biz_outbound_provider_account_fk
   foreign key (tenant_id, business_id, branch_id, provider, provider_account)
   references public.biz_provider_accounts
-    (tenant_id, business_id, branch_id, provider, provider_account);
+    (tenant_id, business_id, branch_id, provider, provider_account)
+  not valid;
+
+-- Post-deployment reconciliation (service role only; see the deployment
+-- runbooks). Real WhatsApp and Telegram provider accounts must be
+-- registered in public.biz_provider_accounts first -- never register
+-- controlled-e2e-test or any other test fixture as a real account.
+-- Then confirm no historical routed row still points outside the
+-- registry (counts only -- never select message contents or secrets):
+--
+--   select count(*) from public.biz_submissions s
+--     where s.provider_account is not null
+--       and not exists (
+--         select 1 from public.biz_provider_accounts a
+--         where a.tenant_id = s.tenant_id
+--           and a.business_id = s.business_id
+--           and a.branch_id = s.branch_id
+--           and a.provider = s.provider
+--           and a.provider_account = s.provider_account);
+--
+--   select count(*) from public.biz_outbound_messages o
+--     where o.provider_account is not null
+--       and o.business_id is not null and o.branch_id is not null
+--       and not exists (
+--         select 1 from public.biz_provider_accounts a
+--         where a.tenant_id = o.tenant_id
+--           and a.business_id = o.business_id
+--           and a.branch_id = o.branch_id
+--           and a.provider = o.provider
+--           and a.provider_account = o.provider_account);
+--
+-- Only when both counts are zero, validate (separate transaction):
+--   alter table public.biz_submissions
+--     validate constraint biz_submissions_provider_account_fk;
+--   alter table public.biz_outbound_messages
+--     validate constraint biz_outbound_provider_account_fk;
 
 -- ---------------------------------------------------------------------------
 -- 3. Shared authorization helper (owner-only): exact scope match plus
