@@ -113,6 +113,10 @@ class ProcessInboxTests(unittest.TestCase):
                     "submission_kind": "sale",
                     "request_key": json["p_request_key"],
                     "notified": 1, "skipped": [], "is_retry": False})
+            if path == "/rest/v1/rpc/amose_apply_delivery_status":
+                return httpx.Response(200, json={"status": "ok",
+                    "applied": False, "reason": "unknown_message",
+                    "is_retry": False})
             return httpx.Response(post_status)
         client.get = AsyncMock(side_effect=fake_get)
         client.post = AsyncMock(side_effect=fake_post)
@@ -428,17 +432,25 @@ class ProcessInboxTests(unittest.TestCase):
         self.assertEqual(summary["review_requests_queued"], 1)
         self.assertEqual(summary["submitted"], 1)
 
+    # Delivery statuses correlate to their outbound row through the
+    # monotonic delivery RPC (observability only): still acknowledged
+    # without ever creating a submission, posting records, or touching
+    # human confirmation.
     def test_status_event_is_acknowledged_without_submission(self):
         event = {"id": "wamid.1", "status": "delivered", "timestamp": "123"}
         summary, client = self._run([inbox_row(event=event, kind="status")], [], [])
-        self.assertEqual(summary, {"scanned": 1, "submitted": 0, "unmatched": 0, "skipped_non_message": 1,
-            "clarifications_queued": 0,
-            "images_linked": 0, "images_unlinked": 0, "images_ambiguous": 0, "failed": 0,
-            "reviews_confirmed": 0, "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
-            "review_requests_queued": 0, "review_requests_failed": 0,
-            "review_requests_already_queued": 0, "review_requests_no_reviewer": 0,
-            "review_requests_unroutable": 0})
-        client.post.assert_not_called()
+        self.assertEqual(summary["scanned"], 1)
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["failed"], 0)
+        submissions = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"]
+        self.assertEqual(submissions, [])
+        delivery = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/rpc/amose_apply_delivery_status"]
+        self.assertEqual(len(delivery), 1)
+        body = delivery[0].kwargs["json"]
+        self.assertEqual(body["p_provider_message_id"], "wamid.1")
+        self.assertEqual(body["p_delivery_state"], "delivered")
         self.assertEqual(client.patch.call_args.kwargs["json"], {"status": "processed"})
 
     # processing failure preserves the inbox event for retry, and records retry state

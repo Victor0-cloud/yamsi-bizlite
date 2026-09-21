@@ -210,10 +210,89 @@ async def _request_branch_selection(client, row, tenant_id, employee_id,
     return True
 
 
+DELIVERY_RPC = "amose_apply_delivery_status"
+DELIVERY_ALLOWLIST = frozenset({DELIVERY_RPC})
+DELIVERY_STATES = frozenset({"sent", "delivered", "read", "failed"})
+
+
+def _sanitize_status_error(errors):
+    """Reduces a Meta status errors array to one short classification
+    ("<code>:<title>") without storing any payload. Returns None when no
+    usable code is present. Never raises on non-list input."""
+    if not isinstance(errors, list):
+        return None
+    for entry in errors:
+        if not isinstance(entry, dict):
+            continue
+        code = entry.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            continue
+        title = entry.get("title")
+        if isinstance(title, str) and title.strip():
+            return ("%d:%s" % (code, title.strip()))[:140]
+        return str(code)
+    return None
+
+
+async def _call_delivery_rpc(client, provider, provider_account,
+        provider_message_id, delivery_state, error_code):
+    """Applies one delivery state through exactly one allowlisted RPC.
+    Unknown message IDs safely report applied=false; anything
+    database-shaped raises DatabaseUnavailable for retry."""
+    if DELIVERY_RPC not in DELIVERY_ALLOWLIST:
+        raise DatabaseUnavailable("Refusing to call non-allowlisted function")
+    try:
+        response = await client.post("/rest/v1/rpc/" + DELIVERY_RPC, json={
+            "p_provider": provider, "p_provider_account": provider_account,
+            "p_provider_message_id": provider_message_id,
+            "p_delivery_state": delivery_state,
+            "p_error_code": error_code})
+    except httpx.HTTPError:
+        raise DatabaseUnavailable("Delivery RPC unreachable") from None
+    if response.status_code not in (200, 201):
+        raise DatabaseUnavailable("Delivery RPC refused the request")
+    try:
+        result = response.json()
+    except ValueError:
+        raise DatabaseUnavailable("Delivery RPC returned invalid JSON") from None
+    if not isinstance(result, dict) or not isinstance(result.get("applied"), bool):
+        raise DatabaseUnavailable("Delivery RPC returned an unexpected result")
+    return result
+
+
+async def _process_status(client, row, summary):
+    """Handles one Meta delivery-status event: correlates it to its
+    outbound row inside the row's own tenant/account scope and records
+    the monotonic delivery state. Creates no submission, posts no
+    operational data, and never touches human confirmation -- status
+    sync is observability only. Unknown or duplicate states are harmless
+    (the row is consumed either way); malformed events fail visibly."""
+    inbox_id = row["id"]
+    body = row.get("payload") or {}
+    event = body.get("event") or {}
+    provider = row.get("provider") or "whatsapp"
+    account = row.get("provider_account")
+    message_id = event.get("id")
+    state = event.get("status")
+    if not isinstance(message_id, str) or not message_id \
+            or state not in DELIVERY_STATES \
+            or not isinstance(account, str) or not account:
+        await _mark_inbox(client, inbox_id, "failed",
+            processing_error="Invalid delivery status event")
+        summary["failed"] += 1
+        return
+    await _call_delivery_rpc(client, provider, account, message_id, state,
+        _sanitize_status_error(event.get("errors")))
+    await _mark_inbox(client, inbox_id, "processed")
+
+
 async def _process_one(client, row, summary):
     inbox_id = row["id"]
     body = row.get("payload") or {}
     event = body.get("event") or {}
+    if body.get("kind") == "status":
+        await _process_status(client, row, summary)
+        return
     if body.get("kind") != "message":
         await _mark_inbox(client, inbox_id, "processed")
         summary["skipped_non_message"] += 1
@@ -302,7 +381,13 @@ async def _process_one(client, row, summary):
         "employee_id": employee_id, "inbox_id": inbox_id, "idempotency_key": inbox_id,
         "kind": extraction["kind"],
         "payload": {"message_text": text, "sender_phone": sender, "parsed": extraction},
-        "status": "draft"}
+        "status": "draft",
+        # Route snapshot bound to the authorized provider-account
+        # registry by a database foreign key: the database rejects any
+        # submission whose inbound route is unknown, disabled, or scoped
+        # to a different business/branch (fail closed, never guessed).
+        "provider": row.get("provider"),
+        "provider_account": row.get("provider_account")}
     await _create_submission(client, submission)
     submission_id = await _get_submission_id(client, tenant_id, business_id, branch_id, inbox_id)
     if submission_id is not None:

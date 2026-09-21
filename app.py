@@ -103,6 +103,49 @@ async def telegram_review_sync(data: dict):
     except DatabaseUnavailable:
         raise HTTPException(503, "Telegram sync unavailable; check server configuration")
 
+@app.get("/internal/whatsapp-readiness", dependencies=[Depends(require_api_key)])
+def whatsapp_readiness():
+    """Owner-only live-readiness report: which WhatsApp requirements are
+    configured and structurally usable (inbound, outbound, database, full
+    live). Reports booleans and missing-item names only -- secret values
+    never appear. The public /health endpoint stays untouched and safe."""
+    import whatsapp_config
+    return whatsapp_config.check_whatsapp_readiness()
+
+
+@app.get("/internal/provider-accounts", dependencies=[Depends(require_api_key)])
+async def provider_accounts(tenant_id: str = ""):
+    """Owner-only visibility over registered provider accounts for one
+    tenant (scope, provider, account, enabled state, label). No secrets
+    exist on these rows. Registration itself happens through the
+    service role (see the runbook); this route only reads."""
+    import provider_accounts
+    if not isinstance(tenant_id, str) or not tenant_id.strip():
+        raise HTTPException(422, "A tenant_id query parameter is required")
+    try:
+        return {"tenant_id": tenant_id.strip(),
+            "accounts": await provider_accounts.list_accounts(tenant_id)}
+    except DatabaseUnavailable:
+        raise HTTPException(503, "Provider accounts unavailable; check server configuration")
+
+
+@app.post("/internal/recover-stale-outbound", dependencies=[Depends(require_api_key)])
+async def recover_stale_outbound(data: dict):
+    """Owner-only controlled recovery for crashed dispatch passes:
+    re-queues 'sending' rows whose claim lease expired (default 30
+    minutes), transactionally via amose_reclaim_stale_outbound. Bounded
+    single invocation -- no polling loop; Render restarts simply leave
+    the next explicit call to pick up the work."""
+    import outbound_dispatch_worker
+    body = data or {}
+    try:
+        return await outbound_dispatch_worker.recover_stale_claims(
+            stale_seconds=body.get("stale_seconds", 1800),
+            limit=body.get("limit", 20))
+    except outbound_dispatch_worker.OutboundRecoveryError:
+        raise HTTPException(503, "Outbound recovery unavailable; check server configuration")
+
+
 @app.post("/internal/dispatch-outbound", dependencies=[Depends(require_api_key)])
 async def dispatch_outbound(data: dict):
     """Runs one bounded outbound-dispatch pass (claim each queued row once,

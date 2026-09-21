@@ -43,7 +43,13 @@ async def dispatch_queued_message(message_row, phone_number_id):
     """Performs the real send for a single already-queued (or already-
     claimed, status='sending' -- see outbound_dispatch_worker) message.
     Reached only through the dispatch worker (webhook background trigger
-    or owner endpoint), never directly from ingestion."""
+    or owner endpoint), never directly from ingestion. Uses exactly the
+    row's own provider_account snapshot -- never a re-derived value.
+
+    Failure results carry retryable=True only for errors the client
+    classified retryable (timeouts, 429/5xx); every other failure,
+    including unclassified legacy OutboundUnavailable errors, reports
+    retryable=False so the worker never retries a final refusal."""
     if message_row["status"] not in ("queued", "sending") or not message_row.get("provider_sender"):
         return message_row
     try:
@@ -53,7 +59,8 @@ async def dispatch_queued_message(message_row, phone_number_id):
         failure_reason = str(error)
         await rest_patch("/rest/v1/biz_outbound_messages", {"id": "eq." + message_row["id"]},
             {"status": "failed", "failure_reason": failure_reason})
-        return {**message_row, "status": "failed", "failure_reason": failure_reason}
+        return {**message_row, "status": "failed", "failure_reason": failure_reason,
+            "retryable": bool(getattr(error, "retryable", False))}
     sent_at = datetime.now(timezone.utc).isoformat()
     await rest_patch("/rest/v1/biz_outbound_messages", {"id": "eq." + message_row["id"]},
         {"status": "sent", "sent_at": sent_at, "provider_message_id": result.get("provider_message_id")})
