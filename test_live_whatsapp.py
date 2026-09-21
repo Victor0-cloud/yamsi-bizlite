@@ -1007,5 +1007,102 @@ class FunctionVolatilityTests(unittest.TestCase):
             self.assertIn("security definer", header)
 
 
+# ---------------------------------------------------------------------------
+# 13. Legacy-history foreign keys: NOT VALID preserves historical rows
+# while new writes stay enforced, and the BEFORE triggers keep failing
+# closed on unknown or disabled accounts.
+# ---------------------------------------------------------------------------
+
+
+class ProviderAccountConstraintTests(unittest.TestCase):
+    FKS = ("biz_submissions_provider_account_fk",
+        "biz_outbound_provider_account_fk")
+    SCOPE_COLUMNS = ("tenant_id", "business_id", "branch_id",
+        "provider", "provider_account")
+
+    @classmethod
+    def _migration(cls):
+        return FunctionVolatilityTests._migration()
+
+    @classmethod
+    def _fk_block(cls, name):
+        text = cls._migration()
+        start = text.index("add constraint %s" % name)
+        return text[start:text.index(";", start)]
+
+    @classmethod
+    def _body(cls, name):
+        text = cls._migration()
+        start = text.index(
+            "create or replace function public.%s(" % name)
+        end = text.index("$func$;", start)
+        return text[start:end]
+
+    def test_both_foreign_keys_are_not_valid(self):
+        for name in self.FKS:
+            with self.subTest(fk=name):
+                block = self._fk_block(name).lower()
+                self.assertIn("not valid", block)
+
+    def test_not_valid_keys_still_pin_exact_scope(self):
+        for name in self.FKS:
+            with self.subTest(fk=name):
+                block = self._fk_block(name)
+                self.assertIn(
+                    "references public.biz_provider_accounts", block)
+                fk_part, ref_part = block.split("references")
+                for column in self.SCOPE_COLUMNS:
+                    self.assertIn(column, fk_part)
+                    self.assertIn(column, ref_part)
+
+    def test_validation_runs_only_after_reconciliation(self):
+        for line in self._migration().splitlines():
+            if "validate constraint" in line.lower():
+                self.assertTrue(line.strip().startswith("--"), line)
+
+    def test_guards_reject_unknown_or_disabled_accounts(self):
+        submission = self._body(
+            "_amose_guard_submission_provider_account")
+        self.assertIn("_amose_provider_account_authorized(", submission)
+        self.assertIn("raise exception 'UNAUTHORIZED", submission)
+        outbound = self._body(
+            "_amose_guard_outbound_provider_account")
+        self.assertIn("_amose_provider_account_authorized(", outbound)
+        self.assertIn("_amose_provider_tenant_authorized(", outbound)
+        self.assertEqual(
+            outbound.count("raise exception 'UNAUTHORIZED"), 2)
+        lowered = self._migration().lower()
+        self.assertIn(
+            "before insert on public.biz_submissions", lowered)
+        self.assertIn(
+            "before insert or update on public.biz_outbound_messages",
+            lowered)
+
+    def test_registered_enabled_scope_authorizes(self):
+        for name in ("_amose_provider_account_authorized",
+                "_amose_provider_tenant_authorized"):
+            with self.subTest(helper=name):
+                body = self._body(name)
+                self.assertIn("public.biz_provider_accounts", body)
+                self.assertIn("a.enabled = true", body)
+
+    def test_migration_preserves_history_without_seeding(self):
+        lowered = self._migration().lower()
+        self.assertNotRegex(lowered, r"(?m)^\s*delete\s+from\s")
+        self.assertNotIn("truncate", lowered)
+        self.assertNotIn(
+            "insert into public.biz_provider_accounts", lowered)
+
+    def test_later_migrations_leave_legacy_keys_alone(self):
+        for name in ("20260922000000_telegram_full_intake.sql",
+                "20260923000000_intake_correction_cancel.sql"):
+            with self.subTest(migration=name):
+                with open("supabase/migrations/" + name,
+                        encoding="utf-8") as handle:
+                    text = handle.read()
+                self.assertNotIn("provider_account_fk", text)
+                self.assertNotIn("validate constraint", text.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
