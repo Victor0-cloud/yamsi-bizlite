@@ -1,12 +1,14 @@
-"""Telegram review-backup channel adapter.
+"""Telegram staff-report intake and review channel adapter.
 
 Telegram is a channel adapter, not a second business workflow: this module
-performs zero direct writes to submissions, operational, Brain, audit, or
-review-decision tables. Every approval, rejection, or correction executes
-through the existing boundaries -- review_service (which owns the single
-Phase 4 RPC per chat command) and human_confirmation (Phase 3 RPCs) -- with
-provider='telegram'. Tenant/business/branch/employee scope always resolves
-from locked database rows, never from Telegram-supplied values.
+performs zero direct writes to operational, Brain, audit, or
+review-decision tables. Intake drafts are created through the shared
+message_processor draft helpers only; every approval, rejection, or
+correction executes through the existing boundaries -- review_service
+(which owns the single Phase 4 RPC per chat command) and
+human_confirmation (Phase 3 RPCs) -- with provider='telegram'.
+Tenant/business/branch/employee scope always resolves from locked
+database rows, never from Telegram-supplied values.
 
 Trust model (fail closed throughout):
 
@@ -42,8 +44,11 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 import human_confirmation
+import message_processor
 import outbound_telegram
 import review_service
+import rule_engine
+import telegram_intake
 from review_service import TERMINAL_REVIEW_ERRORS
 from supabase_backend import credentials, DatabaseUnavailable
 
@@ -83,26 +88,49 @@ QUEUE_STATUSES = frozenset({"queued", "already_queued",
     "no_eligible_reviewer", "reviewer_unroutable"})
 
 HELP_UNLINKED = (
-    "YAMSI review backup: this Telegram account is not linked. "
+    "YAMSI: this Telegram account is not linked. "
     "Ask your administrator for a one-time link, then open it and press "
     "START. Reviewers approve with the Approve button or with "
-    "REVIEW CONFIRM <reference> KEY <key>.")
+    "REVIEW CONFIRM <reference> KEY <key>. "
+    "Once linked, send staff reports such as SALE 50 bags at 500 cash.")
 
 HELP_LINKED = (
-    "YAMSI review backup: linked. You will receive review requests here. "
-    "Approve with the Approve button, or reply "
+    "YAMSI linked: send staff reports here, one report per message. "
+    "Examples: SALE 50 bags at 500 cash; "
+    "PRODUCTION 225 bags used 7kg nylon; EXPENSE fuel 15000; "
+    "DEPOSIT 80000 bank transfer; STOCK 120 normal bags and 75 cold bags; "
+    "CUSTOMER PAYMENT Emeka 25000 transfer; CUSTOMER DEBT Ada 12000. "
+    "You will also receive review requests here. Reviewers confirm with "
+    "the Approve button, or reply "
     "REVIEW CONFIRM <reference> KEY <key> "
     "[CORRECTION <reason>], or "
     "REVIEW REJECT <reference> KEY <key> REASON <reason>.")
 
 HELP_LINKED_ORDINARY = (
-    "YAMSI review backup: this Telegram account is linked. "
-    "This bot accepts review requests and REVIEW commands only -- it does "
-    "not take sales, stock, production, or expense reports. "
-    "Approve with the Approve button, or reply "
-    "REVIEW CONFIRM <reference> KEY <key> "
-    "[CORRECTION <reason>], or "
-    "REVIEW REJECT <reference> KEY <key> REASON <reason>.")
+    "YAMSI linked: send staff reports here, one report per message. "
+    "Examples: SALE 50 bags at 500 cash; "
+    "PRODUCTION 225 bags used 7kg nylon; EXPENSE fuel 15000; "
+    "DEPOSIT 80000 bank transfer; STOCK 120 normal bags and 75 cold bags; "
+    "CUSTOMER PAYMENT Emeka 25000 transfer; CUSTOMER DEBT Ada 12000. "
+    "Incomplete reports will ask for the missing detail. Reviewers decide "
+    "with REVIEW CONFIRM <reference> KEY <key> [CORRECTION <reason>] or "
+    "REVIEW REJECT <reference> KEY <key> REASON <reason>. "
+    "Correct a value with CORRECTION field=value (e.g. CORRECTION "
+    "amount=25000). Withdraw your own pending draft with "
+    "CANCEL <reference>.")
+
+HELP_NO_ASSIGNMENT = (
+    "YAMSI: this Telegram account is linked but has no branch assignment "
+    "yet. Ask your administrator to assign you a branch, then send your "
+    "report (e.g. SALE 50 bags at 500 cash).")
+
+INTAKE_UNSUPPORTED = (
+    "Could not recognize a report in your message. Send one report per "
+    "message, starting with one of: SALE, PRODUCTION, EXPENSE, DEPOSIT, "
+    "STOCK, CUSTOMER PAYMENT, CUSTOMER DEBT. "
+    "E.g. SALE 50 bags at 500 cash.")
+
+_INTAKE_EXAMPLE_HINT = "SALE 50 bags at 500 cash"
 
 REJECT_INSTRUCTIONS = (
     "To reject, reply with: REVIEW REJECT {ref} KEY {key} REASON <reason>. "
@@ -527,7 +555,10 @@ def _new_summary():
     return {"scanned": 0, "links_consumed": 0, "reviews_confirmed": 0,
         "reviews_rejected": 0, "reviews_refused": 0, "reviews_failed": 0,
         "callbacks_answered": 0, "help_sent": 0, "unmatched": 0,
-        "notifications_sent": 0, "notifications_failed": 0, "failed": 0}
+        "notifications_sent": 0, "notifications_failed": 0, "failed": 0,
+        "intakes_submitted": 0, "intake_unlinked": 0,
+        "intake_unsupported": 0, "intake_clarifications": 0,
+        "intake_queue_failed": 0, "submissions_cancelled": 0}
 
 
 def _client_headers():
@@ -580,9 +611,235 @@ async def _is_linked_sender(client, sender):
     return len(rows) > 0
 
 
+async def _resolve_sender_identity(client, sender):
+    """Resolves the numeric Telegram sender to its locked
+    (tenant_id, employee_id) via the existing secure link table, or
+    returns None when unlinked. Only the numeric sender id is ever
+    bound -- display names, usernames, phone numbers, and any
+    tenant/employee/scope values from the message are ignored.
+    Transport, status, and payload failures raise WorkflowDatabaseError
+    (fail closed) without embedding secrets or identifiers."""
+    clean_sender = _require_sender_id(sender)
+    try:
+        response = await client.get("/rest/v1/biz_sender_identities",
+            params={"provider": "eq." + PROVIDER,
+                "provider_sender": "eq." + clean_sender,
+                "select": "tenant_id,employee_id", "limit": "1"})
+    except httpx.HTTPError:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity") from None
+    if response.status_code != 200:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity")
+    try:
+        rows = response.json()
+    except ValueError:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity") from None
+    if not isinstance(rows, list):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity")
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or not row.get("tenant_id") \
+            or not row.get("employee_id"):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender identity")
+    return row["tenant_id"], row["employee_id"]
+
+
+async def _sender_assignments(client, tenant_id, employee_id):
+    """Distinct (business_id, branch_id) pairs assigned to the employee.
+    Rows with blank scope are ignored, never guessed. Failures raise
+    WorkflowDatabaseError (fail closed)."""
+    try:
+        response = await client.get("/rest/v1/biz_assignments",
+            params={"tenant_id": "eq." + tenant_id,
+                "employee_id": "eq." + employee_id,
+                "select": "business_id,branch_id"})
+    except httpx.HTTPError:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender assignments") from None
+    if response.status_code != 200:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender assignments")
+    try:
+        rows = response.json()
+    except ValueError:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender assignments") from None
+    if not isinstance(rows, list):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to resolve sender assignments")
+    candidates = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        business = row.get("business_id")
+        branch = row.get("branch_id")
+        if isinstance(business, str) and business.strip() \
+                and isinstance(branch, str) and branch.strip():
+            candidates.add((business.strip(), branch.strip()))
+    return candidates
+
+
+def _extract_intake(command, remainder, business_id, branch_id):
+    """Builds the draft extraction for one detected intake command.
+
+    Shared kinds (sale, production, expense, bank_deposit) run through
+    the existing business-scoped rule_engine.extract() on
+    telegram_intake's normalized wording, so Telegram drafts carry the
+    same parsed shape as WhatsApp drafts. STOCK, CUSTOMER PAYMENT, and
+    CUSTOMER DEBT use the direct telegram_intake parsers producing the
+    postable stock / customer_payment / customer_debt kinds. An explicit
+    command that yields no parseable extraction keeps its hinted kind
+    with missing fields named, never invented."""
+    if command == "STOCK":
+        return telegram_intake.parse_stock(remainder)
+    if command == "CUSTOMER PAYMENT":
+        return telegram_intake.parse_customer_payment(remainder)
+    if command == "CUSTOMER DEBT":
+        return telegram_intake.parse_customer_debt(remainder)
+    hint = telegram_intake.SHARED_COMMAND_KINDS.get(command)
+    normalized, extra, extra_prov = telegram_intake.normalize_for_shared(
+        command, remainder)
+    extraction = rule_engine.extract(
+        business_id, branch_id, normalized, received_at=None)
+    if not isinstance(extraction, dict):
+        extraction = {"kind": None, "fields": {}, "missing_fields": [],
+            "errors": ["No recognized intent in message"]}
+    if extraction.get("kind") is None:
+        extraction = {"kind": hint, "intent": hint, "fields": {},
+            "provenance": {},
+            "missing_fields": list(
+                telegram_intake.REQUIRED_MISSING.get(hint, [])),
+            "errors": ["Could not parse the %s report; send it as e.g. "
+                "%s" % (command.title(), _INTAKE_EXAMPLE_HINT)]}
+    if extra:
+        fields = dict(extraction.get("fields") or {})
+        provenance = dict(extraction.get("provenance") or {})
+        for key, value in extra.items():
+            if key not in fields:
+                fields[key] = value
+        for key, value in extra_prov.items():
+            if key not in provenance:
+                provenance[key] = value
+        extraction["fields"] = fields
+        extraction["provenance"] = provenance
+    return extraction
+
+
+async def _process_intake(client, inbox_id, sender, chat_id, text, summary):
+    """Full staff-report intake for one linked sender's message.
+
+    Unlinked senders get safe linking instructions and create no draft.
+    Linked senders resolve tenant/business/branch/employee from locked
+    rows (multi-branch senders must prefix "<branch>:"), then the report
+    is parsed, stored as a draft through the shared message_processor
+    helpers, and shown back with Confirm / Correct / Cancel guidance
+    pointing at the existing REVIEW commands. Review-request queueing is
+    best-effort: the draft already exists, so a queue failure never
+    loses the report."""
+    identity = await _resolve_sender_identity(client, sender)
+    if identity is None:
+        await _send_best_effort(summary, chat_id, HELP_UNLINKED,
+            "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        summary["unmatched"] += 1
+        summary["intake_unlinked"] += 1
+        return {"outcome": "help"}
+    tenant_id, employee_id = identity
+    candidates = await _sender_assignments(client, tenant_id, employee_id)
+    if len(candidates) == 1:
+        business_id, branch_id = next(iter(candidates))
+        report_text = text
+    elif candidates:
+        resolved = message_processor._resolve_multi_assignment(
+            candidates, text)
+        if resolved is None:
+            await _send_best_effort(summary, chat_id,
+                message_processor._clarification_text(candidates),
+                "help_sent")
+            await _set_inbox_status(client, inbox_id, "processed")
+            summary["unmatched"] += 1
+            summary["intake_clarifications"] += 1
+            return {"outcome": "help"}
+        (business_id, branch_id), report_text = resolved
+    else:
+        await _send_best_effort(summary, chat_id, HELP_NO_ASSIGNMENT,
+            "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        summary["unmatched"] += 1
+        return {"outcome": "help"}
+    command, remainder = telegram_intake.detect_command(report_text)
+    if command is None:
+        await _send_best_effort(summary, chat_id,
+            INTAKE_UNSUPPORTED + " " + HELP_LINKED_ORDINARY, "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        summary["unmatched"] += 1
+        summary["intake_unsupported"] += 1
+        return {"outcome": "help"}
+    extraction = _extract_intake(
+        command, remainder, business_id, branch_id)
+    submission = {
+        "tenant_id": tenant_id, "business_id": business_id,
+        "branch_id": branch_id, "employee_id": employee_id,
+        "inbox_id": inbox_id, "idempotency_key": inbox_id,
+        "kind": extraction.get("kind") or "telegram_intake",
+        "payload": {"message_text": text, "sender_phone": sender,
+            "parsed": extraction},
+        "status": "draft",
+        "provider": PROVIDER, "provider_account": BOT_ACCOUNT}
+    await message_processor._create_submission(client, submission)
+    submission_id = await message_processor._get_submission_id(
+        client, tenant_id, business_id, branch_id, inbox_id)
+    if submission_id is None:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to read back the created submission")
+    await rule_engine.apply_rules(tenant_id, business_id, branch_id,
+        employee_id, submission_id, extraction, inbox_id=inbox_id)
+    review_ref = None
+    request_key = "tgintake:" + inbox_id
+    queue_note = None
+    try:
+        queued = await queue_telegram_reviews(submission_id, request_key)
+        if queued.get("status") in ("queued", "already_queued"):
+            review_ref = queued.get("review_ref")
+        elif queued.get("status") == "no_eligible_reviewer":
+            queue_note = ("Draft recorded; no eligible reviewer is "
+                "configured yet, so an administrator will follow up.")
+        elif queued.get("status") == "reviewer_unroutable":
+            queue_note = ("Draft recorded; reviewers have no reachable "
+                "Telegram account yet, so an administrator will follow up.")
+        else:
+            queue_note = ("Draft recorded; an administrator will follow up.")
+    except (TelegramAdapterError, human_confirmation.WorkflowError):
+        summary["intake_queue_failed"] += 1
+        queue_note = ("Draft recorded; automatic reviewer notification "
+            "failed, so an administrator will follow up.")
+    try:
+        await review_service.queue_review_requests(
+            client, submission_id, "queuereq:" + inbox_id)
+    except (human_confirmation.WorkflowError, DatabaseUnavailable):
+        summary["intake_queue_failed"] += 1
+    if review_ref is None and queue_note is None:
+        queue_note = ("Draft recorded; an administrator will follow up.")
+    await _send_best_effort(summary, chat_id,
+        telegram_intake.format_intake_preview(
+            extraction, review_ref=review_ref,
+            request_key=request_key if review_ref else None,
+            queue_note=queue_note if not review_ref else None),
+        "help_sent")
+    await _set_inbox_status(client, inbox_id, "processed")
+    summary["intakes_submitted"] += 1
+    return {"outcome": "intake", "kind": extraction.get("kind"),
+        "submission_id": submission_id}
+
+
 async def _send_identity_help(client, inbox_id, sender, chat_id, summary):
     """Sends the ordinary-message help reply matching the stored Telegram
-    identity: linked reviewers hear review-only scope, genuinely unlinked
+    identity: linked senders hear the intake examples, genuinely unlinked
     senders hear the linking instructions. Creates no submissions and
     adds no intake of any kind. Database failures propagate (fail closed)
     with no reply and no identifiers exposed."""
@@ -670,8 +927,58 @@ async def _process_message(client, inbox_id, message, summary):
             "help_sent")
         return {"outcome": "refused", "error": "RefusedReviewCommand"}
 
-    return await _send_identity_help(
-        client, inbox_id, sender, chat_id, summary)
+    # Submitter withdrawal: only the linked reporter can cancel their own
+    # pending draft (enforced in the database). Anyone else -- reviewers,
+    # strangers, other tenants -- is refused. Cancellation posts nothing
+    # and is fully distinct from reviewer rejection.
+    cancel = human_confirmation.parse_cancel_command(text)
+    if cancel is not None:
+        return await _process_cancel(
+            client, inbox_id, sender, chat_id, cancel, summary)
+
+    return await _process_intake(
+        client, inbox_id, sender, chat_id, text, summary)
+
+
+async def _process_cancel(client, inbox_id, sender, chat_id, command,
+        summary):
+    """Runs one parsed CANCEL command through the dedicated cancel RPC.
+
+    Terminal refusals (unknown reference, wrong reporter, terminal row)
+    consume the row with a refusal reply; transient database failures mark
+    the row failed for manual reprocessing. Returns an outcome dict."""
+    ref = command.get("review_ref")
+    try:
+        result = await review_service.cancel_from_chat(
+            client, ref, PROVIDER, sender, "cancel:" + inbox_id,
+            reason=command.get("reason"))
+    except TERMINAL_REVIEW_ERRORS as error:
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        await _send_best_effort(summary, chat_id,
+            "Refused (%s). Send /start for command help."
+            % type(error).__name__, "help_sent")
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    except human_confirmation.AcknowledgementRoutingError as error:
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        await _send_best_effort(summary, chat_id,
+            "Refused (%s). Send /start for command help."
+            % type(error).__name__, "help_sent")
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    except human_confirmation.WorkflowDatabaseError as error:
+        await _set_inbox_status(client, inbox_id, "failed",
+            _failure_note(error))
+        summary["failed"] += 1
+        return {"outcome": "failed", "error": type(error).__name__}
+    await _send_best_effort(summary, chat_id,
+        "Cancelled %s draft %s." % (
+            result.get("submission_kind"), ref), "help_sent")
+    await _set_inbox_status(client, inbox_id, "processed")
+    summary["submissions_cancelled"] += 1
+    return {"outcome": "cancelled", "result": result}
 
 
 async def _process_callback(client, inbox_id, callback_query, summary):

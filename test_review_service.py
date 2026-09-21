@@ -555,7 +555,8 @@ class ReviewCommandWiringTests(unittest.TestCase):
         body = rpc_posts[0].kwargs["json"]
         self.assertEqual(set(body),
             {"p_review_ref", "p_reviewer_provider", "p_reviewer_sender",
-                "p_request_key", "p_correction_reason"})
+                "p_request_key", "p_correction_reason", "p_corrections"})
+        self.assertEqual(body["p_corrections"], {})
         self.assertEqual(body["p_reviewer_sender"], SENDER)
         self.assertEqual(client.patch.call_args.kwargs["json"],
             {"status": "processed"})

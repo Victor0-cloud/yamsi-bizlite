@@ -36,6 +36,7 @@ from human_confirmation import (
     WorkflowError,
     confirm_submission,
     execute_review_command,
+    parse_cancel_command,
     parse_review_command,
     posting_for_kind,
     preview_submission,
@@ -1189,7 +1190,7 @@ class ReviewCommandParserTests(unittest.TestCase):
         parsed = parse_review_command(self._command("CONFIRM"))
         self.assertEqual(parsed, {"action": "confirm",
             "review_ref": REVIEW_REF, "request_key": REQUEST_KEY,
-            "reason": None})
+            "reason": None, "corrections": {}})
         self.assertNotIn("submission_id", parsed)
 
     def test_explicit_confirm_with_correction_parses(self):
@@ -1198,6 +1199,43 @@ class ReviewCommandParserTests(unittest.TestCase):
         self.assertEqual(parsed["action"], "confirm")
         self.assertEqual(parsed["review_ref"], REVIEW_REF)
         self.assertEqual(parsed["reason"], "price fixed from crate label")
+        self.assertEqual(parsed["corrections"], {})
+
+    def test_correction_values_parse_to_corrections(self):
+        parsed = parse_review_command(
+            "REVIEW CONFIRM %s KEY %s CORRECTION amount=25000 method=cash"
+            % (REVIEW_REF, REQUEST_KEY))
+        self.assertEqual(parsed["corrections"],
+            {"amount": "25000", "method": "cash"})
+        self.assertIsNone(parsed["reason"])
+        parsed = parse_review_command(
+            'REVIEW CONFIRM %s KEY %s CORRECTION customer="Emeka Okafor" '
+            "-- recount done" % (REVIEW_REF, REQUEST_KEY))
+        self.assertEqual(parsed["corrections"],
+            {"customer": "Emeka Okafor"})
+        self.assertEqual(parsed["reason"], "recount done")
+        parsed = parse_review_command(
+            self._command("CONFIRM", reason="amount=25000 wrong figures"))
+        self.assertEqual(parsed["corrections"], {"amount": "25000"})
+        self.assertEqual(parsed["reason"], "wrong figures")
+
+    def test_blank_correction_value_never_parses(self):
+        self.assertIsNone(parse_review_command(
+            "REVIEW CONFIRM %s KEY %s CORRECTION amount= "
+            % (REVIEW_REF, REQUEST_KEY)))
+
+    def test_cancel_command_parses(self):
+        parsed = parse_cancel_command("CANCEL %s" % REVIEW_REF)
+        self.assertEqual(parsed, {"action": "cancel",
+            "review_ref": REVIEW_REF, "reason": None})
+        parsed = parse_cancel_command(
+            "cancel %s filed twice" % REVIEW_REF.lower())
+        self.assertEqual(parsed["review_ref"], REVIEW_REF)
+        self.assertEqual(parsed["reason"], "filed twice")
+        for text in ("CANCEL", "CANCEL not-a-ref",
+                "CANCEL %s" % SUBMISSION_ID, "", None,
+                "REVIEW CANCEL %s KEY k1" % REVIEW_REF):
+            self.assertIsNone(parse_cancel_command(text), msg=str(text))
 
     def test_explicit_reject_parses(self):
         parsed = parse_review_command(self._command("REJECT"))

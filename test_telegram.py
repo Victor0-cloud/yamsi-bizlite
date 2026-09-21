@@ -556,10 +556,13 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
                 if c.args[0] == "/rest/v1/biz_submissions"], [])
         self.assertEqual(summary["unmatched"], 1)
 
-    async def test_ordinary_text_linked_sender_gets_review_only_reply(self):
+    async def test_ordinary_text_linked_sender_gets_intake_help(self):
         outcome, summary, client, _, command_mock, send_mock = \
             await self._run_message("hello",
-                identity_rows=[{"employee_id": EMP_UUID}])
+                identity_rows=[{"tenant_id": TENANT_UUID,
+                    "employee_id": EMP_UUID,
+                    "business_id": "amose_table_water",
+                    "branch_id": "asaba"}])
         command_mock.assert_not_called()
         self.assertEqual(
             [c for c in client.post.call_args_list
@@ -568,12 +571,12 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         reply = send_mock.call_args.args[1]
         self.assertIn("linked", reply.lower())
         self.assertNotIn("not linked", reply.lower())
+        self.assertIn("SALE 50 bags at 500 cash", reply)
         self.assertIn("REVIEW", reply)
-        self.assertIn("does not take sales", reply)
-        params = client.get.call_args.kwargs["params"]
-        self.assertEqual(params, {"provider": "eq.telegram",
+        identity_params = client.get.call_args_list[0].kwargs["params"]
+        self.assertEqual(identity_params, {"provider": "eq.telegram",
             "provider_sender": "eq." + CHAT_ID,
-            "select": "employee_id", "limit": "1"})
+            "select": "tenant_id,employee_id", "limit": "1"})
         self.assertEqual(
             client.patch.call_args.kwargs["json"], {"status": "processed"})
         self.assertEqual(summary["unmatched"], 1)
@@ -593,13 +596,17 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         # reply is routed to the chat the message came from.
         outcome, summary, client, _, _, send_mock = \
             await self._run_message("hello",
-                identity_rows=[{"employee_id": EMP_UUID}],
+                identity_rows=[{"tenant_id": TENANT_UUID,
+                    "employee_id": EMP_UUID,
+                    "business_id": "amose_table_water",
+                    "branch_id": "asaba"}],
                 chat_id="999888777", sender_id=CHAT_ID)
         self.assertEqual(outcome["outcome"], "help")
         reply = send_mock.call_args.args[1]
         self.assertNotIn("not linked", reply.lower())
-        params = client.get.call_args.kwargs["params"]
-        self.assertEqual(params["provider_sender"], "eq." + CHAT_ID)
+        identity_params = client.get.call_args_list[0].kwargs["params"]
+        self.assertEqual(
+            identity_params["provider_sender"], "eq." + CHAT_ID)
         self.assertEqual(send_mock.call_args.args[0], "999888777")
         self.assertEqual(summary["unmatched"], 1)
 
@@ -618,18 +625,23 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_reply_leaks_no_cross_tenant_identifiers(self):
         # Whatever tenant the linked row belongs to, the help reply
-        # exposes no tenant/employee/sender identifiers and the lookup
-        # carries no tenant scope that could reach another tenant's data.
+        # exposes no tenant/employee/sender identifiers and the identity
+        # lookup carries no tenant scope that could reach another
+        # tenant's data (later assignment scoping reuses only the
+        # locked row's own tenant).
         outcome, summary, client, _, _, send_mock = \
             await self._run_message("hello",
-                identity_rows=[{"employee_id": EMP_UUID}])
+                identity_rows=[{"tenant_id": TENANT_UUID,
+                    "employee_id": EMP_UUID,
+                    "business_id": "amose_table_water",
+                    "branch_id": "asaba"}])
         self.assertEqual(outcome["outcome"], "help")
         reply = send_mock.call_args.args[1]
         self.assertNotIn(TENANT_UUID, reply)
         self.assertNotIn(EMP_UUID, reply)
         self.assertNotIn(CHAT_ID, reply)
-        params = client.get.call_args.kwargs["params"]
-        self.assertNotIn("tenant", " ".join(params.keys()))
+        identity_params = client.get.call_args_list[0].kwargs["params"]
+        self.assertNotIn("tenant", " ".join(identity_params.keys()))
 
     async def test_ordinary_text_identity_lookup_failure_fails_closed(self):
         client = mock_batch_client()
