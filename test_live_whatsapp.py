@@ -809,6 +809,39 @@ class WorkerRetryTests(unittest.TestCase):
                 outbound_dispatch_worker._claim("msg-1"))
         self.assertIsNone(claimed)
 
+    def test_telegram_rows_never_claimed_by_whatsapp_worker(self):
+        telegram_row = {**WORKER_ROW, "id": "tg-1",
+            "provider": "telegram", "provider_sender": "7551230024",
+            "message_type": "review_request"}
+
+        async def server_filter(path, params):
+            self.assertEqual(params.get("provider"), "eq.whatsapp")
+            rows = [r for r in [WORKER_ROW, telegram_row]
+                if params.get("provider") in (
+                    None, "eq." + r.get("provider", "whatsapp"))]
+            return [r for r in rows if r.get("status") == "queued"]
+
+        with patch("outbound_dispatch_worker.rest_get",
+                   new_callable=AsyncMock,
+                   side_effect=server_filter) as rget, \
+             patch("outbound_dispatch_worker._claim",
+                   new_callable=AsyncMock) as claim, \
+             patch("outbound_dispatch_worker.notifier.dispatch_queued_message",
+                   new_callable=AsyncMock,
+                   return_value={"status": "sent"}) as dispatch, \
+             patch("outbound_dispatch_worker.retry_engine.record_success",
+                   new_callable=AsyncMock), \
+             patch("outbound_dispatch_worker.retry_engine.record_failure",
+                   new_callable=AsyncMock):
+            summary = asyncio.run(
+                outbound_dispatch_worker.dispatch_pending())
+        self.assertEqual(summary, {"scanned": 1, "sent": 1, "failed": 0,
+            "claim_conflicts": 0})
+        claimed_ids = [c.args[0] for c in claim.call_args_list]
+        self.assertNotIn("tg-1", claimed_ids)
+        for call in dispatch.call_args_list:
+            self.assertNotEqual(call.args[0].get("id"), "tg-1")
+
 
 class RecoverStaleTests(unittest.TestCase):
     def _run(self, response, stale_seconds=1800, limit=20):

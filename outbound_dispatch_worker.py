@@ -119,7 +119,13 @@ async def _claim(message_id):
 
 
 async def dispatch_pending(limit=BATCH_LIMIT, now=None):
+    # Provider separation: this worker sends WhatsApp rows only. Telegram
+    # rows (provider='telegram') belong to the Telegram dispatcher, which
+    # mints server-bound button tokens and sends through the Bot API --
+    # claiming them here once stranded an approval in 'sending' with no
+    # delivery and no failure recorded.
     rows = await rest_get("/rest/v1/biz_outbound_messages", {
+        "provider": "eq.whatsapp",
         "status": "eq.queued", "order": "queued_at.asc", "limit": str(limit)})
     now = now or _now()
     summary = {"scanned": 0, "sent": 0, "failed": 0, "claim_conflicts": 0}

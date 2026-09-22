@@ -37,8 +37,17 @@ INBOX_BATCH_LIMIT = 50
 _SALE_KEYWORDS = ("sold", "sale")
 _CURRENCY_HINTS = {"ngn": "NGN", "naira": "NGN", "₦": "NGN"}
 _FULL_SALE = re.compile(
-    r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)\s+(?:at|for|@)\s+(?P<unit_price>\d+(?:\.\d+)?)")
+    r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)\s+"
+    r"(?:(?P<prep>at|for|@)\s+(?:(?:a\s+)?total\s+(?:of\s+)?)?|total\s+)"
+    r"(?P<amount>\d+(?:\.\d+)?)")
 _PARTIAL_SALE = re.compile(r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)")
+# A trailing number with no preposition ("SALE 2 bags 900") states an
+# amount whose role is unknown -- total or per-unit must be asked.
+_PARTIAL_AMOUNT = re.compile(
+    r"(?i)\bsold\b\s+\d+(?:\.\d+)?\s+[a-zA-Z]+\s+(?P<amount>\d+(?:\.\d+)?)")
+# Explicit per-unit markers: "each" or "per <unit>".
+_PER_UNIT_MARK = re.compile(r"(?i)\b(each|per\s+(?:bag|bottle|sachet|carton|crate|litre|piece|unit)s?)\b")
+_TOTAL_WORD = re.compile(r"(?i)\btotal\b")
 _BRANCH_PREFIX = re.compile(r"^\s*([^:]{1,64}?)\s*:\s*(.*)$", re.DOTALL)
 CLARIFICATION_MESSAGE_TYPE = "branch_clarification"
 
@@ -55,6 +64,66 @@ def _detect_currency(text):
     return None
 
 
+def _format_naira_whole(amount):
+    """Short naira display for clarification questions (900 -> ₦900)."""
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return None
+    if value == int(value):
+        return "₦%d" % int(value)
+    return "₦%g" % value
+
+
+def _resolve_sale_amount(text, quantity, amount, prep):
+    """Decides what a stated sale amount means. Returns
+    ("unit", unit_price, total) or ("total", unit_price, total) with
+    whole-naira floats, or (None, None, None) when the wording is
+    genuinely ambiguous -- a stated total must never silently become a
+    per-unit price.
+
+    "each"/"per <unit>" pins per-unit; "for"/"total" pins the total;
+    "at"/"@" keeps the legacy per-unit reading; anything else asks.
+    """
+    try:
+        qty = float(quantity)
+        total_or_unit = float(amount)
+    except (TypeError, ValueError):
+        return None, None, None
+    per_unit_mark = _PER_UNIT_MARK.search(text) is not None
+    total_word = _TOTAL_WORD.search(text) is not None
+    if per_unit_mark and (total_word or (prep or "").lower() == "for"):
+        return None, None, None
+    if per_unit_mark:
+        if qty != int(qty) or qty < 1:
+            return None, None, None
+        unit = total_or_unit
+        return "unit", unit, qty * unit
+    if total_word or (prep or "").lower() == "for" or prep is None:
+        if qty != int(qty) or qty < 1 or total_or_unit < 0:
+            return None, None, None
+        if qty == 1:
+            return "total", total_or_unit, total_or_unit
+        if total_or_unit != int(total_or_unit):
+            return None, None, None
+        unit = total_or_unit / int(qty)
+        if unit != int(unit):
+            return None, None, None
+        return "total", float(int(unit)), total_or_unit
+    if (prep or "").lower() in ("at", "@"):
+        if qty != int(qty) or qty < 1:
+            return None, None, None
+        return "unit", total_or_unit, qty * total_or_unit
+    return None, None, None
+
+
+def _sale_clarification(amount):
+    shown = _format_naira_whole(amount)
+    if shown is None:
+        return None
+    return "Is %s the total or the price for one bag?" % shown
+
+
 def parse_message(text):
     """Deterministic parser. Only reports fields explicitly present in the
     text; missing information is listed in missing_fields, never invented."""
@@ -63,34 +132,62 @@ def parse_message(text):
     fields = {}
     missing = []
     errors = []
+    clarification = None
     match = _FULL_SALE.search(text)
     if match:
         intent = "sale"
         fields["quantity"] = float(match.group("quantity"))
         fields["unit"] = _singularize(match.group("unit"))
-        fields["unit_price"] = float(match.group("unit_price"))
+        role, unit_price, total = _resolve_sale_amount(
+            text, match.group("quantity"), match.group("amount"),
+            match.group("prep"))
+        if role is None:
+            missing.append("unit_price")
+            errors.append("Sale amount is ambiguous: cannot tell a total "
+                "from a per-unit price")
+            clarification = _sale_clarification(match.group("amount"))
+        else:
+            fields["unit_price"] = unit_price
+            fields["total_amount"] = total
     else:
-        partial = _PARTIAL_SALE.search(text)
-        if partial:
+        partial_amount = _PARTIAL_AMOUNT.search(text)
+        if partial_amount:
+            partial = _PARTIAL_SALE.search(text)
             intent = "sale"
             fields["quantity"] = float(partial.group("quantity"))
             fields["unit"] = _singularize(partial.group("unit"))
             missing.append("unit_price")
-            errors.append("Sale price not found in message")
-        elif any(k in text.lower() for k in _SALE_KEYWORDS):
-            intent = "sale"
-            missing.extend(["quantity", "unit", "unit_price"])
-            errors.append("Recognized a sale-related message but could not extract quantity/unit/price")
+            errors.append("Sale amount is ambiguous: cannot tell a total "
+                "from a per-unit price")
+            clarification = _sale_clarification(
+                partial_amount.group("amount"))
         else:
-            intent = None
-            errors.append("No recognized intent in message")
+            partial = _PARTIAL_SALE.search(text)
+            if partial:
+                intent = "sale"
+                fields["quantity"] = float(partial.group("quantity"))
+                fields["unit"] = _singularize(partial.group("unit"))
+                missing.append("unit_price")
+                errors.append("Sale price not found in message")
+            elif any(k in text.lower() for k in _SALE_KEYWORDS):
+                intent = "sale"
+                missing.extend(["quantity", "unit", "unit_price"])
+                errors.append("Recognized a sale-related message but could not extract quantity/unit/price")
+            else:
+                intent = None
+                errors.append("No recognized intent in message")
     if intent == "sale":
         currency = _detect_currency(text)
         if currency:
             fields["currency"] = currency
         else:
             missing.append("currency")
-    return {"intent": intent, "fields": fields, "missing_fields": missing, "errors": errors}
+    result = {"intent": intent, "fields": fields, "missing_fields": missing, "errors": errors}
+    if clarification is not None:
+        # Genuinely ambiguous total vs per-unit: the caller must ask the
+        # reporter and create no draft, never guess a price role.
+        result["clarification"] = clarification
+    return result
 
 
 async def _get_json(client, path, params):
@@ -286,6 +383,36 @@ async def _process_status(client, row, summary):
     await _mark_inbox(client, inbox_id, "processed")
 
 
+SALE_CLARIFICATION_MESSAGE_TYPE = "sale_clarification"
+
+
+async def _request_sale_clarification(client, row, tenant_id, business_id,
+        branch_id, employee_id, sender, question, summary):
+    """Queues one idempotent sale_clarification row when a sale amount is
+    genuinely ambiguous (total vs per-unit). No draft is created: a stated
+    total must never silently become a per-unit price. The row is fully
+    scoped (business/branch are known); only the price role is unknown."""
+    key = row["id"] + ":" + SALE_CLARIFICATION_MESSAGE_TYPE
+    existing = await _get_json(client, "/rest/v1/biz_outbound_messages",
+        {"idempotency_key": "eq." + key, "select": "id"})
+    if existing:
+        return False
+    response = await client.post("/rest/v1/biz_outbound_messages",
+        params={"on_conflict": "idempotency_key"},
+        headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        json=[{"tenant_id": tenant_id, "business_id": business_id,
+            "branch_id": branch_id,
+            "recipient_employee_id": employee_id, "provider": "whatsapp",
+            "provider_sender": sender, "provider_account": row.get("provider_account"),
+            "related_task_id": None, "message_type": SALE_CLARIFICATION_MESSAGE_TYPE,
+            "message_text": question,
+            "status": "queued", "idempotency_key": key}])
+    if response.status_code not in (200, 201, 204):
+        raise DatabaseUnavailable("Unable to queue sale clarification")
+    summary["clarifications_queued"] += 1
+    return True
+
+
 async def _process_one(client, row, summary):
     inbox_id = row["id"]
     body = row.get("payload") or {}
@@ -376,6 +503,16 @@ async def _process_one(client, row, summary):
     text = report_text if report_text is not None else (
         event.get("text", {}).get("body") if event.get("type") == "text" else None)
     extraction = rule_engine.extract(business_id, branch_id, text, received_at=row.get("received_at"))
+    question = (extraction or {}).get("clarification")
+    if question:
+        # Genuinely ambiguous total vs per-unit price: ask the reporter
+        # and create no draft. A stated total must never silently become
+        # a per-unit price.
+        await _request_sale_clarification(client, row, tenant_id,
+            business_id, branch_id, employee_id, sender, question, summary)
+        await _mark_inbox(client, inbox_id, "processed")
+        summary["unmatched"] += 1
+        return
     submission = {
         "tenant_id": tenant_id, "business_id": business_id, "branch_id": branch_id,
         "employee_id": employee_id, "inbox_id": inbox_id, "idempotency_key": inbox_id,

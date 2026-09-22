@@ -171,6 +171,16 @@ class PreviewTests(unittest.TestCase):
         self.assertNotIn("REVIEW REJECT", text)
         self.assertNotIn("CORRECTION", text)
 
+    def test_preview_names_total_and_unit_for_multi_bag_sale(self):
+        extraction = {"kind": "sale", "fields": {"quantity": 2.0,
+            "unit": "bag", "unit_price": 450.0, "total_amount": 900.0,
+            "payment_method": "cash"}, "missing_fields": [],
+            "errors": []}
+        text = intake.format_intake_preview(
+            extraction, review_ref=REF, request_key="tgintake:inbox-1")
+        self.assertIn("2 bags sold for ₦900 cash (₦450 each).", text)
+        self.assertNotIn("₦1,800", text)
+
     def test_preview_names_missing_in_plain_words(self):
         extraction = {"kind": "stock",
             "fields": {"total_quantity": 200, "unit": "bag"},
@@ -368,6 +378,31 @@ class AuthorizationTests(IntakeFlowHarness):
         self.assertEqual(summary["unmatched"], 1)
         self.assertEqual(
             client.patch.call_args.kwargs["json"], {"status": "processed"})
+
+    async def test_ambiguous_sale_asks_without_draft(self):
+        outcome, summary, client, queue_mock, send_mock, posted = \
+            await self._run_text("SALE 2 bags 900 cash")
+        self.assertEqual(outcome["outcome"], "help")
+        self.assertEqual(posted, [])
+        queue_mock.assert_not_called()
+        reply = send_mock.call_args.args[1]
+        self.assertEqual(reply,
+            "Is ₦900 the total or the price for one bag?")
+        submissions = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/biz_submissions"]
+        self.assertEqual(submissions, [])
+        self.assertEqual(summary["intake_clarifications"], 1)
+
+    async def test_for_total_reports_unit_and_total(self):
+        outcome, summary, client, queue_mock, send_mock, posted = \
+            await self._run_text("SALE 2 bags for 900 naira cash")
+        self.assertEqual(outcome["outcome"], "intake")
+        self.assertEqual(posted[0]["payload"]["parsed"]["fields"]["unit_price"], 450.0)
+        self.assertEqual(posted[0]["payload"]["parsed"]["fields"]["total_amount"], 900.0)
+        reply = send_mock.call_args.args[1]
+        self.assertIn("2 bags sold for", reply)
+        self.assertIn("₦900", reply)
+        self.assertIn("₦450 each", reply)
 
     async def test_multibranch_sender_gets_branch_buttons(self):
         outcome, summary, client, queue_mock, send_mock, posted = \
@@ -618,7 +653,8 @@ class SafetyTests(IntakeFlowHarness):
             "amose_confirm_submission",
             "amose_mint_telegram_flow_token",
             "amose_consume_telegram_flow_token",
-            "amose_stage_telegram_flow", "amose_read_telegram_flows"}
+            "amose_stage_telegram_flow", "amose_read_telegram_flows",
+            "amose_reclaim_stale_outbound"}
         for rpc in rpcs:
             self.assertIn(rpc, allowed, "unexpected RPC: " + rpc)
 

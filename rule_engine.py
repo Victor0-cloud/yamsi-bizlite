@@ -140,13 +140,19 @@ def extract(business_id, branch_id, text, received_at=None):
                 parsed["fields"]["production_date"] = date_part
                 parsed["provenance"]["production_date"] = "system_derived"
                 parsed["missing_fields"] = [key for key in parsed["missing_fields"] if key != "production_date"]
-        return {"kind": parsed["kind"] or "whatsapp_message", "intent": parsed["intent"],
+        out = {"kind": parsed["kind"] or "whatsapp_message", "intent": parsed["intent"],
             "fields": parsed["fields"], "provenance": parsed["provenance"],
             "missing_fields": parsed["missing_fields"], "errors": parsed["errors"]}
+        if parsed.get("clarification"):
+            out["clarification"] = parsed["clarification"]
+        return out
     from message_processor import parse_message
     sale = parse_message(text)
-    return {"kind": sale["intent"] or "whatsapp_message", "intent": sale["intent"],
+    out = {"kind": sale["intent"] or "whatsapp_message", "intent": sale["intent"],
         "fields": sale["fields"], "missing_fields": sale["missing_fields"], "errors": sale["errors"]}
+    if sale.get("clarification"):
+        out["clarification"] = sale["clarification"]
+    return out
 
 
 async def _resolve_employee_by_name(tenant_id, display_name):

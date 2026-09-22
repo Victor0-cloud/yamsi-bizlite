@@ -31,7 +31,10 @@ Safety properties (enforced, tested in test_daily_business_records.py):
   from message text (the verified validators reject non-UUIDs).
 - Money in parsed payment/expense/handover/deposit fields is integer
   kobo (matching the database money unit); sale quantity/unit_price keep
-  the legacy naira/float shape message_processor historically stored.
+  the legacy naira/float shape message_processor historically stored,
+  plus total_amount naira ("for"/"total" states the TOTAL, "at"/"each"
+  the per-unit price -- never guessed, genuinely ambiguous wording sets
+  "clarification" instead of a price).
 - A message strongly matching two or more kinds is ambiguous: it yields
   no kind and an explicit error rather than a guessed classification.
 """
@@ -42,12 +45,23 @@ import re
 # Shared patterns
 # ---------------------------------------------------------------------------
 
-# Legacy sale shapes (identical semantics to message_processor.parse_message
+# Sale shapes (identical semantics to message_processor.parse_message
 # so water-business sale drafts keep the historically stored shape).
+# The amount role is resolved by _resolve_sale_amount, never guessed:
+# "for"/"total" states the TOTAL, "at"/"@"/"each" states the per-unit
+# price, anything else asks the reporter.
 _FULL_SALE = re.compile(
-    r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)\s+(?:at|for|@)\s+(?P<unit_price>\d+(?:\.\d+)?)")
+    r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)\s+"
+    r"(?:(?P<prep>at|for|@)\s+(?:(?:a\s+)?total\s+(?:of\s+)?)?|total\s+)"
+    r"(?P<amount>\d+(?:\.\d+)?)")
 _PARTIAL_SALE = re.compile(
     r"(?i)\bsold\b\s+(?P<quantity>\d+(?:\.\d+)?)\s+(?P<unit>[a-zA-Z]+)")
+# A trailing number with no preposition states an amount whose role is
+# unknown -- total or per-unit must be asked, never assumed.
+_PARTIAL_AMOUNT = re.compile(
+    r"(?i)\bsold\b\s+\d+(?:\.\d+)?\s+[a-zA-Z]+\s+(?P<amount>\d+(?:\.\d+)?)")
+_PER_UNIT_MARK = re.compile(r"(?i)\b(each|per\s+(?:bag|bottle|sachet|carton|crate|litre|piece|unit)s?)\b")
+_TOTAL_WORD = re.compile(r"(?i)\btotal\b")
 _SALE_KEYWORDS = ("sold", "sale")
 
 _CURRENCY_HINTS = {"ngn": "NGN", "naira": "NGN", "\u20a6": "NGN"}
@@ -275,6 +289,65 @@ def _parse_production(text):
     return result
 
 
+def _format_naira_whole(amount):
+    """Short naira display for clarification questions (900 -> ₦900)."""
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return None
+    if value == int(value):
+        return "₦%d" % int(value)
+    return "₦%g" % value
+
+
+def _resolve_sale_amount(text, quantity, amount, prep):
+    """Decides what a stated sale amount means. Returns
+    (role, unit_price, total, stated) with whole-naira floats, where
+    role is "unit" or "total" and stated names which figure the reporter
+    actually wrote ("unit_price" or "total_amount"). Returns
+    (None, None, None, None) when the wording is genuinely ambiguous --
+    a stated total must never silently become a per-unit price.
+
+    Mirrors message_processor._resolve_sale_amount exactly.
+    """
+    try:
+        qty = float(quantity)
+        total_or_unit = float(amount)
+    except (TypeError, ValueError):
+        return None, None, None, None
+    per_unit_mark = _PER_UNIT_MARK.search(text) is not None
+    total_word = _TOTAL_WORD.search(text) is not None
+    if per_unit_mark and (total_word or (prep or "").lower() == "for"):
+        return None, None, None, None
+    if per_unit_mark:
+        if qty != int(qty) or qty < 1:
+            return None, None, None, None
+        return "unit", total_or_unit, qty * total_or_unit, "unit_price"
+    if total_word or (prep or "").lower() == "for" or prep is None:
+        if qty != int(qty) or qty < 1 or total_or_unit < 0:
+            return None, None, None, None
+        if qty == 1:
+            return "total", total_or_unit, total_or_unit, "unit_price"
+        if total_or_unit != int(total_or_unit):
+            return None, None, None, None
+        unit = total_or_unit / int(qty)
+        if unit != int(unit):
+            return None, None, None, None
+        return "total", float(int(unit)), total_or_unit, "total_amount"
+    if (prep or "").lower() in ("at", "@"):
+        if qty != int(qty) or qty < 1:
+            return None, None, None, None
+        return "unit", total_or_unit, qty * total_or_unit, "unit_price"
+    return None, None, None, None
+
+
+def _sale_clarification(amount):
+    shown = _format_naira_whole(amount)
+    if shown is None:
+        return None
+    return "Is %s the total or the price for one bag?" % shown
+
+
 def _parse_sale(text):
     result = _base(text)
     result["kind"] = result["intent"] = "sale"
@@ -287,8 +360,22 @@ def _parse_sale(text):
         provenance["quantity"] = "staff_reported"
         fields["unit"] = _singularize(match.group("unit"))
         provenance["unit"] = "staff_reported"
-        fields["unit_price"] = float(match.group("unit_price"))
-        provenance["unit_price"] = "staff_reported"
+        role, unit_price, total, stated = _resolve_sale_amount(
+            text, match.group("quantity"), match.group("amount"),
+            match.group("prep"))
+        if role is None:
+            missing.append("unit_price")
+            errors.append("Sale amount is ambiguous: cannot tell a total "
+                "from a per-unit price")
+            result["clarification"] = _sale_clarification(
+                match.group("amount"))
+        else:
+            fields["unit_price"] = unit_price
+            provenance["unit_price"] = "staff_reported" \
+                if stated == "unit_price" else "system_derived"
+            fields["total_amount"] = total
+            provenance["total_amount"] = "staff_reported" \
+                if stated == "total_amount" else "system_derived"
         # Optional staff-stated payment method (cash/transfer/pos word).
         # Absent stays absent: never defaulted, never required.
         method = _detect_method(text)
@@ -296,29 +383,42 @@ def _parse_sale(text):
             fields["payment_method"] = method
             provenance["payment_method"] = "staff_reported"
     else:
-        partial = _PARTIAL_SALE.search(text)
-        if partial:
+        numbered = _PARTIAL_AMOUNT.search(text)
+        if numbered:
+            partial = _PARTIAL_SALE.search(text)
             fields["quantity"] = float(partial.group("quantity"))
             provenance["quantity"] = "staff_reported"
             fields["unit"] = _singularize(partial.group("unit"))
             provenance["unit"] = "staff_reported"
             missing.append("unit_price")
-            errors.append("Sale price not found in message")
-        elif any(keyword in text.lower() for keyword in _SALE_KEYWORDS):
-            missing.extend(["quantity", "unit", "unit_price"])
-            errors.append("Recognized a sale-related message but could not "
-                "extract quantity/unit/price")
-            currency = _detect_currency(text)
-            if currency:
-                fields["currency"] = currency
-                provenance["currency"] = "staff_reported"
-            else:
-                missing.append("currency")
-            return result
+            errors.append("Sale amount is ambiguous: cannot tell a total "
+                "from a per-unit price")
+            result["clarification"] = _sale_clarification(
+                numbered.group("amount"))
         else:
-            result["kind"] = result["intent"] = None
-            errors.append("No recognized intent in message")
-            return result
+            partial = _PARTIAL_SALE.search(text)
+            if partial:
+                fields["quantity"] = float(partial.group("quantity"))
+                provenance["quantity"] = "staff_reported"
+                fields["unit"] = _singularize(partial.group("unit"))
+                provenance["unit"] = "staff_reported"
+                missing.append("unit_price")
+                errors.append("Sale price not found in message")
+            elif any(keyword in text.lower() for keyword in _SALE_KEYWORDS):
+                missing.extend(["quantity", "unit", "unit_price"])
+                errors.append("Recognized a sale-related message but "
+                    "could not extract quantity/unit/price")
+                currency = _detect_currency(text)
+                if currency:
+                    fields["currency"] = currency
+                    provenance["currency"] = "staff_reported"
+                else:
+                    missing.append("currency")
+                return result
+            else:
+                result["kind"] = result["intent"] = None
+                errors.append("No recognized intent in message")
+                return result
     currency = _detect_currency(text)
     if currency:
         fields["currency"] = currency
