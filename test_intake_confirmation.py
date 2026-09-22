@@ -206,8 +206,8 @@ class ConfirmLoopTests(unittest.IsolatedAsyncioTestCase):
                 confirm_mock.assert_called_once()
                 args = confirm_mock.call_args.args
                 self.assertEqual(args[1:5], (REF, "telegram", CHAT_ID, "k1"))
-                self.assertIn(REF, replies[-1])
-                self.assertIn("Recorded confirm", replies[-1])
+                self.assertEqual("Approved \u2705", replies[-1])
+                self.assertNotIn(REF, replies[-1])
 
     async def test_correction_carries_reason(self):
         async def corrected(client, ref, provider, sender, key,
@@ -289,7 +289,7 @@ class ConfirmLoopTests(unittest.IsolatedAsyncioTestCase):
                 update, "inbox-4", summary)
         self.assertEqual(outcome["outcome"], "reject")
         reject_mock.assert_called_once()
-        self.assertIn(REF, send_mock.call_args.args[1])
+        self.assertEqual("Rejected.", send_mock.call_args.args[1])
 
     async def test_approve_button_confirms_non_sale_kind(self):
         async def ready(token, sender):
@@ -309,9 +309,15 @@ class ConfirmLoopTests(unittest.IsolatedAsyncioTestCase):
                 "from": {"id": int(CHAT_ID)},
                 "message": {"message_id": 3, "chat": {"id": int(CHAT_ID)}},
                 "data": "e" * 32}})
+        async def no_flow(token, sender):
+            raise tg.TelegramCallbackError(
+                "NOT_FOUND: flow button is not known")
+
         with patch.object(tg, "credentials",
                 return_value=("https://example.supabase.co", "test-key")), \
              patch.object(tg.httpx, "AsyncClient") as factory, \
+             patch.object(tg, "consume_flow_token",
+                new_callable=AsyncMock, side_effect=no_flow), \
              patch.object(tg, "consume_button_token",
                 new_callable=AsyncMock, side_effect=ready), \
              patch.object(review_service_module, "confirm_from_chat",
@@ -328,7 +334,8 @@ class ConfirmLoopTests(unittest.IsolatedAsyncioTestCase):
                 update, "inbox-5", summary)
         self.assertEqual(outcome["outcome"], "confirm")
         confirm_mock.assert_called_once()
-        self.assertIn(REF, send_mock.call_args.args[1])
+        self.assertEqual("Approved \u2705", send_mock.call_args.args[1])
+        self.assertNotIn(REF, send_mock.call_args.args[1])
         self.assertEqual(summary["reviews_confirmed"], 1)
 
     async def test_cross_tenant_confirm_refused(self):
