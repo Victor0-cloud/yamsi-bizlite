@@ -53,6 +53,56 @@ class ParseMessageTests(unittest.TestCase):
         self.assertEqual(result["errors"], ["Empty or missing message text"])
 
 
+class SaleTotalTests(unittest.TestCase):
+    def test_for_states_total(self):
+        result = parse_message("Sold 2 bags for 900 naira cash")
+        self.assertEqual(result["intent"], "sale")
+        self.assertEqual(result["fields"]["quantity"], 2.0)
+        self.assertEqual(result["fields"]["total_amount"], 900.0)
+        self.assertEqual(result["fields"]["unit_price"], 450.0)
+        self.assertNotIn("clarification", result)
+
+    def test_at_each_states_unit(self):
+        result = parse_message("Sold 2 bags at 450 naira each cash")
+        self.assertEqual(result["fields"]["quantity"], 2.0)
+        self.assertEqual(result["fields"]["unit_price"], 450.0)
+        self.assertEqual(result["fields"]["total_amount"], 900.0)
+        self.assertNotIn("clarification", result)
+
+    def test_single_bag_for(self):
+        result = parse_message("Sold 1 bag for 450 naira cash")
+        self.assertEqual(result["fields"]["quantity"], 1.0)
+        self.assertEqual(result["fields"]["unit_price"], 450.0)
+        self.assertEqual(result["fields"]["total_amount"], 450.0)
+        self.assertNotIn("clarification", result)
+
+    def test_at_states_unit(self):
+        result = parse_message("Sold 50 bags at 350 naira cash")
+        self.assertEqual(result["fields"]["quantity"], 50.0)
+        self.assertEqual(result["fields"]["unit_price"], 350.0)
+        self.assertEqual(result["fields"]["total_amount"], 17500.0)
+        self.assertNotIn("clarification", result)
+
+    def test_bare_number_asks_no_draft_signal(self):
+        result = parse_message("Sold 2 bags 900 cash")
+        self.assertEqual(result["intent"], "sale")
+        self.assertNotIn("unit_price", result["fields"])
+        self.assertIn("unit_price", result["missing_fields"])
+        self.assertEqual(result["clarification"],
+            "Is ₦900 the total or the price for one bag?")
+
+    def test_indivisible_total_asks(self):
+        result = parse_message("Sold 2 bags for 901 naira cash")
+        self.assertNotIn("unit_price", result["fields"])
+        self.assertEqual(result["clarification"],
+            "Is ₦901 the total or the price for one bag?")
+
+    def test_conflicting_each_and_for_asks(self):
+        result = parse_message("Sold 2 bags for 900 at 450 each cash")
+        self.assertNotIn("unit_price", result["fields"])
+        self.assertIn("clarification", result)
+
+
 class BranchPrefixTests(unittest.TestCase):
     PAIRS = [("water", "asaba"), ("water", "warri")]
 
@@ -343,6 +393,39 @@ class ProcessInboxTests(unittest.TestCase):
         self.assertIn("ASABA:", row["message_text"])
         self.assertIn("WARRI:", row["message_text"])
         self.assertEqual(client.patch.call_args.kwargs["json"], {"status": "unmatched"})
+
+    def test_ambiguous_sale_total_queues_clarification_no_draft(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("Sold 2 bags 900 cash"))],
+            [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
+            [{"business_id": "water", "branch_id": "warri"}])
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["unmatched"], 1)
+        self.assertEqual(summary["clarifications_queued"], 1)
+        self.assertEqual(self._submission_posts(client), [])
+        queued = self._clarification_posts(client)
+        self.assertEqual(len(queued), 1)
+        row = queued[0].kwargs["json"][0]
+        self.assertEqual(row["message_type"], "sale_clarification")
+        self.assertEqual(row["message_text"],
+            "Is ₦900 the total or the price for one bag?")
+        self.assertEqual(row["business_id"], "water")
+        self.assertEqual(row["branch_id"], "warri")
+        self.assertEqual(client.patch.call_args.kwargs["json"],
+            {"status": "processed"})
+
+    def test_for_total_submits_unit_and_total(self):
+        summary, client = self._run(
+            [inbox_row(event=self._text_event("Sold 2 bags for 900 cash"))],
+            [{"tenant_id": "tenant-1", "employee_id": "emp-1"}],
+            [{"business_id": "water", "branch_id": "warri"}])
+        self.assertEqual(summary["submitted"], 1)
+        submitted = self._submission_posts(client)[0].kwargs["json"][0]
+        self.assertEqual(
+            submitted["payload"]["parsed"]["fields"]["unit_price"], 450.0)
+        self.assertEqual(
+            submitted["payload"]["parsed"]["fields"]["total_amount"], 900.0)
+        self.assertEqual(self._clarification_posts(client), [])
 
     def test_invalid_prefix_queues_clarification(self):
         summary, client = self._run(

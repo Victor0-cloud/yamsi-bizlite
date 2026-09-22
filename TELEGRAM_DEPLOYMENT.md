@@ -68,6 +68,11 @@ Flow per message (same shared workflow as WhatsApp):
    `CUSTOMER DEBT` use the structured `telegram_intake` parsers
    producing the postable `stock` / `customer_payment` / `customer_debt`
    kinds. Nothing is invented: absent details are listed as missing.
+   Sale amount role is never guessed: `for`/`total` states the TOTAL
+   (`SALE 2 bags for 900 naira` = 2 x ₦450), `at`/`@`/`each` states the
+   per-unit price, and anything else gets the reporter a short
+   question (`Is ₦900 the total or the price for one bag?`) with no
+   draft created.
 4. The report is stored as a `draft` `biz_submissions` row keyed by the
    Telegram `update_id` inbox row (transactional dedup: retries never
    create a second draft), with `provider='telegram'` and
@@ -169,6 +174,24 @@ Bot username: `@YamsiBizLiteBot` (public address, not a secret).
    quote to an administrator.
 5. If Telegram delivery is down, WhatsApp review is unaffected, and
    vice versa: each channel queues and sends independently.
+6. Dispatcher ownership is split by provider: the WhatsApp worker
+   only ever scans `provider='whatsapp'` rows, and the Telegram
+   dispatcher only `provider='telegram'` rows -- a cross-provider
+   claim once stranded an approval in `sending` with no delivery and
+   no failure recorded. Every Telegram dispatch pass first sweeps
+   stale `sending` claims (lease older than 30 minutes) back to
+   `queued`; every claim stamps `claimed_at`, and every terminal mark
+   (`sent`/`failed`/requeued) clears it. A single bad row requeues
+   with backoff and never blocks later rows; re-minted buttons
+   replace superseded ones, so a reclaimed resend never leaves two
+   actionable approval messages.
+7. Pre-send actionability gate: after the claim and before any mint
+   or Telegram call, the dispatcher verifies the review case is
+   still `open` and its submission still a `draft`. Anything else
+   (cancelled, rejected, confirmed, reversed, unknown) is never
+   minted or sent -- the row goes terminal `failed` with the safe
+   reason `review_no_longer_actionable` and a cleared lease, while
+   later valid rows still send.
 
 ## Legacy history reconciliation and constraint validation
 

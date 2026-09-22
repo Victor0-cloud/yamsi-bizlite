@@ -69,6 +69,60 @@ class ValidExtractionTests(unittest.TestCase):
         self.assertEqual(result["fields"]["payment_method"], "cash")
         self.assertEqual(result["errors"], [])
 
+    def test_sale_for_states_total(self):
+        result = water_intake.extract_water_record(
+            "Sold 2 bags for 900 naira cash")
+        self.assertEqual(result["kind"], "sale")
+        self.assertEqual(result["fields"]["quantity"], 2.0)
+        self.assertEqual(result["fields"]["total_amount"], 900.0)
+        self.assertEqual(result["fields"]["unit_price"], 450.0)
+        self.assertEqual(
+            result["provenance"]["total_amount"], "staff_reported")
+        self.assertEqual(
+            result["provenance"]["unit_price"], "system_derived")
+        self.assertEqual(result["errors"], [])
+        self.assertNotIn("clarification", result)
+
+    def test_sale_at_each_states_unit(self):
+        result = water_intake.extract_water_record(
+            "Sold 2 bags at 450 naira each cash")
+        self.assertEqual(result["fields"]["unit_price"], 450.0)
+        self.assertEqual(result["fields"]["total_amount"], 900.0)
+        self.assertEqual(
+            result["provenance"]["unit_price"], "staff_reported")
+        self.assertEqual(
+            result["provenance"]["total_amount"], "system_derived")
+        self.assertEqual(result["errors"], [])
+
+    def test_sale_single_bag_for(self):
+        result = water_intake.extract_water_record(
+            "Sold 1 bag for 450 naira cash")
+        self.assertEqual(result["fields"]["unit_price"], 450.0)
+        self.assertEqual(result["fields"]["total_amount"], 450.0)
+        self.assertEqual(result["errors"], [])
+
+    def test_sale_fifty_bags_at(self):
+        result = water_intake.extract_water_record(
+            "Sold 50 bags at 350 naira cash")
+        self.assertEqual(result["fields"]["unit_price"], 350.0)
+        self.assertEqual(result["fields"]["total_amount"], 17500.0)
+        self.assertEqual(result["errors"], [])
+
+    def test_sale_bare_number_asks(self):
+        result = water_intake.extract_water_record("Sold 2 bags 900 cash")
+        self.assertEqual(result["kind"], "sale")
+        self.assertNotIn("unit_price", result["fields"])
+        self.assertIn("unit_price", result["missing_fields"])
+        self.assertEqual(result["clarification"],
+            "Is ₦900 the total or the price for one bag?")
+
+    def test_sale_indivisible_total_asks(self):
+        result = water_intake.extract_water_record(
+            "Sold 2 bags for 901 naira cash")
+        self.assertNotIn("unit_price", result["fields"])
+        self.assertEqual(result["clarification"],
+            "Is ₦901 the total or the price for one bag?")
+
     def test_payment_received(self):
         result = water_intake.extract_water_record(
             "Received 50000 cash for sale YR-ABCD234EFG")

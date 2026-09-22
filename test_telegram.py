@@ -923,10 +923,31 @@ def queued_row(row_id="out-1", status="queued", message_type="review_request",
 
 class DispatchTests(unittest.IsolatedAsyncioTestCase):
     async def _run_dispatch(self, rows, mint=None, send=None,
-            review_ref=None, flow_mint=None):
+            review_ref=None, flow_mint=None, cases=None):
         client = mock_batch_client()
+        case_map = cases or {}
+
+        def ref_case(ref):
+            return case_map.get(ref, ("open", "draft"))
 
         async def fake_get(path, params=None):
+            params = params or {}
+            if path == "/rest/v1/biz_review_cases":
+                ref = (params.get("review_ref") or "")[3:]
+                if cases is not None and ref not in case_map:
+                    return httpx.Response(200, json=[])
+                status, _ = ref_case(ref)
+                return httpx.Response(200, json=[{"status": status,
+                    "submission_id": "sub-" + ref}])
+            if path == "/rest/v1/biz_submissions":
+                sub = (params.get("id") or "")[3:]
+                for ref, (_, sub_status) in case_map.items():
+                    if sub == "sub-" + ref:
+                        return httpx.Response(200, json=[
+                            {"status": sub_status}])
+                if cases is None:
+                    return httpx.Response(200, json=[{"status": "draft"}])
+                return httpx.Response(200, json=[])
             return httpx.Response(200, json=rows)
 
         async def fake_patch(path, params=None, json=None, headers=None):
@@ -995,6 +1016,208 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
             if c.kwargs["json"].get("status") == "sent"]
         self.assertEqual(len(sent_patch), 1)
         self.assertIn("provider_message_id", sent_patch[0].kwargs["json"])
+
+    async def test_claim_stamps_lease_and_sweep_runs_first(self):
+        summary, client, _, send_mock = await self._run_dispatch(
+            [queued_row()])
+        self.assertEqual(summary["sent"], 1)
+        claim = [c for c in client.patch.call_args_list
+            if c.kwargs["json"].get("status") == "sending"][0]
+        self.assertIn("claimed_at", claim.kwargs["json"])
+        sweeps = [c for c in client.post.call_args_list
+            if c.args[0] == "/rest/v1/rpc/amose_reclaim_stale_outbound"]
+        self.assertEqual(len(sweeps), 1)
+        self.assertEqual(
+            sweeps[0].kwargs["json"]["p_stale_seconds"], 1800)
+
+    async def test_success_clears_lease_and_stores_receipt(self):
+        summary, client, _, _ = await self._run_dispatch([queued_row()])
+        self.assertEqual(summary["sent"], 1)
+        sent_patch = [c for c in client.patch.call_args_list
+            if c.kwargs["json"].get("status") == "sent"][0]
+        body = sent_patch.kwargs["json"]
+        self.assertIn("sent_at", body)
+        self.assertEqual(body["provider_message_id"], "7")
+        self.assertIsNone(body["claimed_at"])
+
+    async def test_unexpected_mint_error_requeues_without_blocking_next(self):
+        calls = []
+
+        async def flaky_mint(ref, action, sender):
+            calls.append(action)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return {"token": "tok-%s" % action,
+                "request_key": "tgcb-tok-%s" % action}
+
+        summary, client, _, send_mock = await self._run_dispatch(
+            [queued_row("out-1"), queued_row("out-2")], mint=flaky_mint)
+        self.assertEqual(summary, {"scanned": 2, "sent": 1, "failed": 0,
+            "claim_conflicts": 0, "deferred": 0, "retried": 1})
+        send_mock.assert_called_once()
+        requeued = [c for c in client.patch.call_args_list
+            if c.kwargs["json"].get("status") == "queued"]
+        self.assertEqual(len(requeued), 1)
+        body = requeued[0].kwargs["json"]
+        self.assertEqual(body["attempt_count"], 1)
+        self.assertIn("next_attempt_at", body)
+        self.assertIsNone(body["claimed_at"])
+        self.assertEqual(body["failure_reason"], "RuntimeError: failed")
+        self.assertNotIn("boom", body["failure_reason"])
+
+    async def test_failed_row_does_not_stop_batch(self):
+        async def down(chat_id, text, reply_markup=None):
+            raise outbound_telegram_module.OutboundUnavailable("no token")
+
+        bad = queued_row("out-1")
+        bad["attempt_count"] = 4
+        summary, _, _, send_mock = await self._run_dispatch(
+            [bad, queued_row("out-2")], send=down)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["sent"], 0)
+        self.assertEqual(summary["retried"], 1)
+        self.assertEqual(send_mock.call_count, 2)
+
+    async def test_sent_row_is_never_delivered_twice(self):
+        store = [queued_row()]
+
+        async def fake_get(path, params=None):
+            if path == "/rest/v1/biz_review_cases":
+                return httpx.Response(200, json=[{"status": "open",
+                    "submission_id": "sub-1"}])
+            if path == "/rest/v1/biz_submissions":
+                return httpx.Response(200, json=[{"status": "draft"}])
+            return httpx.Response(200, json=[
+                r for r in store if r["status"] == "queued"])
+
+        async def fake_patch(path, params=None, json=None, headers=None):
+            target = [r for r in store if r["id"] == params["id"][3:]]
+            if params.get("status") == "eq.queued" and target \
+                    and target[0]["status"] == "queued":
+                target[0]["status"] = json["status"]
+                if "claimed_at" in (json or {}):
+                    target[0]["claimed_at"] = json["claimed_at"]
+                return httpx.Response(200, json=[target[0]])
+            if target and "status" in (json or {}):
+                target[0].update(json)
+            return httpx.Response(200, json=[])
+
+        client = mock_batch_client()
+        client.get = AsyncMock(side_effect=fake_get)
+        client.patch = AsyncMock(side_effect=fake_patch)
+        with patch.object(tg, "credentials",
+                return_value=("https://example.supabase.co", "test-key")), \
+             patch.object(tg.httpx, "AsyncClient") as factory, \
+             patch.object(tg, "mint_button_token",
+                new_callable=AsyncMock) as mint_mock, \
+             patch.object(tg, "mint_flow_token",
+                new_callable=AsyncMock) as flow_mock, \
+             patch.object(outbound_telegram_module, "send_message",
+                new_callable=AsyncMock,
+                return_value={"provider_message_id": "7"}) as send_mock:
+            factory.return_value.__aenter__.return_value = client
+
+            async def ok_mint(ref, action, sender):
+                return {"token": "tok-%s" % action,
+                    "request_key": "tgcb-tok-%s" % action}
+
+            async def no_flow(*args, **kwargs):
+                raise tg.TelegramLinkError("NOT_FOUND")
+
+            mint_mock.side_effect = ok_mint
+            flow_mock.side_effect = no_flow
+            first = await tg.dispatch_queued()
+            second = await tg.dispatch_queued()
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(second["sent"], 0)
+        self.assertEqual(second["scanned"], 0)
+        send_mock.assert_called_once()
+        self.assertEqual(store[0]["status"], "sent")
+
+    async def test_failure_note_never_leaks_details(self):
+        self.assertEqual(
+            tg._failure_note(RuntimeError("tok-secret-123")), "RuntimeError: failed")
+        self.assertEqual(
+            tg._failure_note(
+                tg.TelegramCallbackError("tok-secret-123")),
+            "TelegramCallbackError: refused")
+
+    async def test_cancelled_review_never_sent(self):
+        summary, client, mint_mock, send_mock = await self._run_dispatch(
+            [queued_row()], cases={REF: ("cancelled", "cancelled")})
+        self.assertEqual(summary, {"scanned": 1, "sent": 0, "failed": 1,
+            "claim_conflicts": 0, "deferred": 0, "retried": 0})
+        mint_mock.assert_not_called()
+        send_mock.assert_not_called()
+        terminal = [c for c in client.patch.call_args_list
+            if c.kwargs["json"].get("status") == "failed"]
+        self.assertEqual(len(terminal), 1)
+        body = terminal[0].kwargs["json"]
+        self.assertEqual(body["failure_reason"],
+            "review_no_longer_actionable")
+        self.assertIsNone(body["claimed_at"])
+
+    async def test_decided_reviews_never_sent(self):
+        for case_status in ("confirmed", "rejected", "reversed"):
+            with self.subTest(case_status=case_status):
+                summary, _, mint_mock, send_mock = \
+                    await self._run_dispatch([queued_row()],
+                        cases={REF: (case_status, case_status)})
+                self.assertEqual(summary["sent"], 0)
+                self.assertEqual(summary["failed"], 1)
+                mint_mock.assert_not_called()
+                send_mock.assert_not_called()
+
+    async def test_unknown_review_never_sent(self):
+        summary, _, mint_mock, send_mock = await self._run_dispatch(
+            [queued_row()], cases={})
+        self.assertEqual(summary["sent"], 0)
+        self.assertEqual(summary["failed"], 1)
+        mint_mock.assert_not_called()
+        send_mock.assert_not_called()
+
+    async def test_cancelled_between_claim_and_send_makes_no_call(self):
+        client = mock_batch_client()
+        row = queued_row("out-1", status="sending")
+
+        async def fake_get(path, params=None):
+            if path == "/rest/v1/biz_review_cases":
+                return httpx.Response(200, json=[{"status": "cancelled",
+                    "submission_id": "sub-1"}])
+            if path == "/rest/v1/biz_submissions":
+                return httpx.Response(200, json=[{"status": "cancelled"}])
+            return httpx.Response(200, json=[])
+
+        async def fake_patch(path, params=None, json=None, headers=None):
+            return httpx.Response(200, json=[])
+
+        client.get = AsyncMock(side_effect=fake_get)
+        client.patch = AsyncMock(side_effect=fake_patch)
+        with patch.object(tg, "mint_button_token",
+                new_callable=AsyncMock) as mint_mock, \
+             patch.object(outbound_telegram_module, "send_message",
+                new_callable=AsyncMock) as send_mock:
+            outcome = await tg._send_claimed(client, row)
+        self.assertEqual(outcome, "failed")
+        mint_mock.assert_not_called()
+        send_mock.assert_not_called()
+        terminal = [c for c in client.patch.call_args_list
+            if c.kwargs["json"].get("status") == "failed"][0]
+        self.assertEqual(terminal.kwargs["json"]["failure_reason"],
+            "review_no_longer_actionable")
+
+    async def test_dead_row_does_not_block_live_row(self):
+        live_ref = "YR-WXYZ234567"
+        live_key = "tg_review_req:%s:%s:%s" % (
+            TENANT_UUID, live_ref, EMP_UUID)
+        rows = [queued_row("out-1"),
+            queued_row("out-2", key=live_key)]
+        summary, _, _, send_mock = await self._run_dispatch(rows,
+            cases={REF: ("cancelled", "cancelled"),
+                live_ref: ("open", "draft")})
+        self.assertEqual(summary["sent"], 1)
+        self.assertEqual(summary["failed"], 1)
+        send_mock.assert_called_once()
 
     async def test_concurrent_claim_conflict_sends_nothing(self):
         summary, _, _, send_mock = await self._run_dispatch(
@@ -1277,7 +1500,8 @@ class ChannelBoundaryTests(unittest.TestCase):
             "amose_confirm_submission",
             "amose_mint_telegram_flow_token",
             "amose_consume_telegram_flow_token",
-            "amose_stage_telegram_flow", "amose_read_telegram_flows"}
+            "amose_stage_telegram_flow", "amose_read_telegram_flows",
+            "amose_reclaim_stale_outbound"}
         for rpc in rpcs:
             self.assertIn(rpc, allowed, "unexpected RPC reference: " + rpc)
 

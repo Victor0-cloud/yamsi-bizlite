@@ -27,6 +27,8 @@ EMP_UUID = "22222222-2222-2222-2222-222222222222"
 SUBMISSION_UUID = "11111111-1111-1111-1111-111111111111"
 MIGRATION = ("supabase/migrations/"
     "20260925000000_telegram_simple_workflow.sql")
+MIGRATION26 = ("supabase/migrations/"
+    "20260926000000_sale_total_disambiguation.sql")
 
 
 def message_update(update_id=100, text="hello", chat_id=CHAT_ID,
@@ -57,6 +59,11 @@ def mock_batch_client():
 
 def read_migration():
     with open(MIGRATION, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def read_migration26():
+    with open(MIGRATION26, encoding="utf-8") as handle:
         return handle.read()
 
 
@@ -550,6 +557,24 @@ class MigrationContractTests(unittest.TestCase):
                 "create or replace function public.%s(" % name, sql)
             self.assertIn(
                 "revoke execute on function public.%s(" % name, sql)
+
+    def test_reviewer_queue_skips_reporter(self):
+        sql = read_migration()
+        self.assertIn(
+            "a.employee_id is distinct from v_submitter", sql)
+
+    def test_sale_clarification_outbound_type_allowed(self):
+        sql = read_migration26()
+        self.assertIn("'sale_clarification'", sql)
+        self.assertIn(
+            "biz_outbound_messages_review_task_check", sql)
+
+    def test_reviewer_sale_text_names_unit_and_total(self):
+        sql = read_migration26()
+        self.assertIn("|| ' each'", sql)
+        self.assertIn("|| 'Total: '", sql)
+        self.assertIn("|| ' sold for '", sql)
+        self.assertIn("' each)'", sql)
 
     def test_python_flow_allowlists_match_migration(self):
         sql = read_migration()

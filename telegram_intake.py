@@ -366,7 +366,9 @@ def _simple_missing_name(field):
 
 
 def _simple_sale_line(fields):
-    """'1 bag sold for ₦450 cash.' or None when details are missing."""
+    """'1 bag sold for ₦450 cash.' or '2 bags sold for ₦900 cash
+    (₦450 each).' -- the total is always named so a per-unit price is
+    never mistaken for the total. None when details are missing."""
     try:
         quantity = float(fields.get("quantity"))
         unit = str(fields.get("unit") or "").strip()
@@ -375,8 +377,13 @@ def _simple_sale_line(fields):
         return None
     if not unit:
         return None
+    try:
+        total = float(fields.get("total_amount"))
+    except (TypeError, ValueError):
+        total = quantity * unit_price
     amount = _format_naira_simple(unit_price)
-    if amount is None:
+    total_text = _format_naira_simple(total)
+    if amount is None or total_text is None:
         return None
     method = str(fields.get("payment_method") or "").strip().lower()
     tail = " %s" % method if method in ("cash", "transfer", "pos") else ""
@@ -384,8 +391,11 @@ def _simple_sale_line(fields):
         shown = "%d" % int(quantity)
     else:
         shown = "%g" % quantity
-    return "%s %s sold for %s%s." % (
-        shown, _plural_unit(quantity, unit), amount, tail)
+    if quantity == 1:
+        return "%s %s sold for %s%s." % (
+            shown, _plural_unit(quantity, unit), amount, tail)
+    return "%s %s sold for %s%s (%s each)." % (
+        shown, _plural_unit(quantity, unit), total_text, tail, amount)
 
 
 def _simple_kobo_line(fields, key="amount_kobo"):

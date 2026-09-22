@@ -306,6 +306,13 @@ def callback_parts(callback_query):
 DISPATCHABLE_TYPES = ("review_request", "review_confirmed",
     "review_rejected", "review_cancelled")
 TG_DISPATCH_MAX_ATTEMPTS = 5
+RECLAIM_RPC = "amose_reclaim_stale_outbound"
+RECLAIM_ALLOWLIST = frozenset({RECLAIM_RPC})
+# A claim older than this is presumed orphaned (crashed sender) and
+# becomes eligible for the stale-claim sweep. comfortably above any
+# single send (HTTP timeout 8s + mint RPCs) and far below the 24h link
+# window, so a live in-flight send is never reclaimed.
+TG_RECLAIM_STALE_SECONDS = 1800
 
 
 def review_keyboard(approve_token, reject_token, correct_token=None):
@@ -998,6 +1005,16 @@ async def _process_intake(client, inbox_id, sender, chat_id, text, summary):
         return {"outcome": "help"}
     extraction = _extract_intake(
         command, remainder, business_id, branch_id)
+    question = (extraction or {}).get("clarification")
+    if question:
+        # Genuinely ambiguous total vs per-unit price: ask the reporter
+        # and create no draft. A stated total must never silently become
+        # a per-unit price.
+        await _send_best_effort(summary, chat_id, question, "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        summary["unmatched"] += 1
+        summary["intake_clarifications"] += 1
+        return {"outcome": "help"}
     submission = {
         "tenant_id": tenant_id, "business_id": business_id,
         "branch_id": branch_id, "employee_id": employee_id,
@@ -1849,14 +1866,38 @@ def _parse_outbound_ack(idempotency_key):
     return parts[1]
 
 
+async def _sweep_stale_claims(client):
+    """Best-effort stale-claim sweep: 'sending' rows whose claim lease
+    expired (crashed sender between claim and bookkeeping) return to
+    'queued' inside the database, transactionally and idempotently.
+    Only rows with claimed_at older than TG_RECLAIM_STALE_SECONDS are
+    touched, so a live in-flight send is never reclaimed. Failures here
+    never fail the dispatch pass itself."""
+    try:
+        response = await client.post(
+            "/rest/v1/rpc/" + RECLAIM_RPC,
+            json={"p_stale_seconds": TG_RECLAIM_STALE_SECONDS,
+                "p_limit": 50})
+    except (DatabaseUnavailable, human_confirmation.WorkflowDatabaseError,
+            httpx.HTTPError):
+        return None
+    if response.status_code not in (200, 201):
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
 async def dispatch_queued(limit=20, review_ref=None, message_types=None):
     """Claims queued Telegram rows (exactly once via a conditional claim)
     and sends review requests with fresh one-tap buttons plus reporter
     acknowledgements as plain text. Minting replaces superseded buttons
     transactionally, so retries never stack live tokens. Delivery
     failures requeue with backoff and stay retryable; only terminal
-    validation errors fail a row. Returns a summary; never raises for a
-    single-row failure."""
+    validation errors fail a row. A stale-claim sweep runs first so no
+    row stays permanently in 'sending'. Returns a summary; never raises
+    for a single-row failure, and one bad row never blocks later rows."""
     summary = {"scanned": 0, "sent": 0, "failed": 0, "claim_conflicts": 0,
         "deferred": 0, "retried": 0}
     types = message_types or DISPATCHABLE_TYPES
@@ -1864,6 +1905,7 @@ async def dispatch_queued(limit=20, review_ref=None, message_types=None):
     try:
         async with httpx.AsyncClient(base_url=url, headers=headers,
                 timeout=8, follow_redirects=False) as client:
+            await _sweep_stale_claims(client)
             params = {"provider": "eq." + PROVIDER,
                 "status": "eq.queued",
                 "message_type": "in.(%s)" % ",".join(types),
@@ -1884,12 +1926,20 @@ async def dispatch_queued(limit=20, review_ref=None, message_types=None):
                 if not _outbound_due(row):
                     summary["deferred"] += 1
                     continue
-                claimed = await client.patch(
-                    "/rest/v1/biz_outbound_messages",
-                    params={"id": "eq." + row["id"],
-                        "status": "eq.queued"},
-                    json={"status": "sending"},
-                    headers={"Prefer": "return=representation"})
+                try:
+                    claimed = await client.patch(
+                        "/rest/v1/biz_outbound_messages",
+                        params={"id": "eq." + row["id"],
+                            "status": "eq.queued"},
+                        json={"status": "sending",
+                            "claimed_at": datetime.now(
+                                timezone.utc).isoformat()},
+                        headers={"Prefer": "return=representation"})
+                except (DatabaseUnavailable,
+                        human_confirmation.WorkflowDatabaseError,
+                        httpx.HTTPError):
+                    summary["failed"] += 1
+                    continue
                 if claimed.status_code not in (200, 201):
                     summary["failed"] += 1
                     continue
@@ -1897,7 +1947,22 @@ async def dispatch_queued(limit=20, review_ref=None, message_types=None):
                 if not claimed_rows:
                     summary["claim_conflicts"] += 1
                     continue
-                outcome = await _send_claimed(client, claimed_rows[0])
+                try:
+                    outcome = await _send_claimed(client, claimed_rows[0])
+                except Exception as error:
+                    # Never leak a claimed row and never abort the batch:
+                    # any unexpected failure requeues this row with
+                    # backoff while later rows still send.
+                    try:
+                        if await _requeue_for_retry(
+                                client, claimed_rows[0], error):
+                            outcome = "retried"
+                        else:
+                            outcome = "failed"
+                    except (DatabaseUnavailable,
+                            human_confirmation.WorkflowDatabaseError,
+                            httpx.HTTPError):
+                        outcome = "failed"
                 if outcome == "sent":
                     summary["sent"] += 1
                 elif outcome == "retried":
@@ -1921,15 +1986,54 @@ async def _requeue_for_retry(client, row, error):
     if attempts >= TG_DISPATCH_MAX_ATTEMPTS:
         await _mark_outbound(client, row["id"], "failed",
             {"attempt_count": attempts,
-                "failure_reason": _failure_note(error)})
+                "failure_reason": _failure_note(error),
+                "claimed_at": None})
         return False
     retry_at = datetime.now(timezone.utc) + timedelta(
         minutes=_retry_delay_minutes(attempts))
     await _mark_outbound(client, row["id"], "queued",
         {"attempt_count": attempts,
             "next_attempt_at": retry_at.isoformat(),
-            "failure_reason": _failure_note(error)})
+            "failure_reason": _failure_note(error),
+            "claimed_at": None})
     return True
+
+
+REVIEW_NOT_ACTIONABLE = "review_no_longer_actionable"
+
+
+async def _review_actionable(client, row):
+    """True only when the review case is still open and its submission
+    is still a reviewable draft. Runs after the claim and before any
+    mint or external send, so a reclaimed stale row for a cancelled
+    review can never deliver an approval message. Lookup transport
+    trouble raises (the row requeues with backoff); a decided, unknown,
+    or unparseable review returns False (the row goes terminal, never
+    sent). Only the safe reason string is ever recorded."""
+    ref = _parse_outbound_ref(row.get("idempotency_key"))
+    if ref is None:
+        return False
+    response = await client.get("/rest/v1/biz_review_cases",
+        params={"review_ref": "eq." + ref,
+            "select": "status,submission_id", "limit": "1"})
+    if response.status_code != 200:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to verify review state")
+    cases = response.json()
+    if len(cases) != 1 or cases[0].get("status") != "open":
+        return False
+    submission_id = cases[0].get("submission_id")
+    if not submission_id:
+        return False
+    response = await client.get("/rest/v1/biz_submissions",
+        params={"id": "eq." + str(submission_id),
+            "select": "status", "limit": "1"})
+    if response.status_code != 200:
+        raise human_confirmation.WorkflowDatabaseError(
+            "Unable to verify submission state")
+    submissions = response.json()
+    return len(submissions) == 1 \
+        and submissions[0].get("status") == "draft"
 
 
 async def _send_claimed(client, row):
@@ -1943,6 +2047,19 @@ async def _send_claimed(client, row):
             ref = _parse_outbound_ref(row.get("idempotency_key"))
             if ref is None:
                 raise TelegramAdapterError("Outbound row is not routable")
+            if not await _review_actionable(client, row):
+                # Stale approval for a decided/unknown review: never
+                # mint, never call Telegram. Terminal and non-actionable
+                # with a safe reason; the lease is released. If this
+                # mark itself fails, the row stays 'sending' and the
+                # next sweep reclaims it back to this same gate.
+                try:
+                    await _mark_outbound(client, row["id"], "failed",
+                        {"failure_reason": REVIEW_NOT_ACTIONABLE,
+                            "claimed_at": None})
+                except human_confirmation.WorkflowDatabaseError:
+                    pass
+                return "failed"
             approve = await mint_button_token(ref, "approve", chat_id)
             try:
                 reject = await mint_button_token(ref, "reject", chat_id)
@@ -1982,16 +2099,25 @@ async def _send_claimed(client, row):
             return "failed"
         await _mark_outbound(client, row["id"], "sent",
             {"sent_at": datetime.now(timezone.utc).isoformat(),
-                "provider_message_id": sent.get("provider_message_id")})
+                "provider_message_id": sent.get("provider_message_id"),
+                "claimed_at": None})
         return "sent"
     except (TelegramAdapterError, TelegramCallbackError,
             human_confirmation.WorkflowError) as error:
         try:
             await _mark_outbound(client, row["id"], "failed",
-                {"failure_reason": _failure_note(error)})
+                {"failure_reason": _failure_note(error),
+                    "claimed_at": None})
         except human_confirmation.WorkflowDatabaseError:
             pass
         return "failed"
+    except Exception as error:
+        # Anything unexpected (mint transport errors, bookkeeping
+        # failures, sender bugs): the row must not stay 'sending'
+        # forever. Requeue with backoff; the dispatch loop isolates
+        # this row so later rows still send.
+        await _requeue_for_retry(client, row, error)
+        return "retried"
 
 
 async def sync_submission_reviews(submission_id, request_key):
