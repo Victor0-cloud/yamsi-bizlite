@@ -152,14 +152,21 @@ Bot username: `@YamsiBizLiteBot` (public address, not a secret).
    branch they may report for.
 4. Staff send reports as above; drafts queue Telegram review requests
    automatically (`tgintake:<inbox_id>`), and WhatsApp reviewers are
-   notified too (`queuereq:<inbox_id>`). After WhatsApp intake creates
-   drafts, call `/internal/telegram-review-sync` per reviewable
-   submission (or on a scheduler). Reviewers with a linked Telegram
-   identity get the request with Approve/Reject buttons; Approve executes
-   the standard chat-confirm, which builds the verified block inside the
-   database for every kind; Reject and Correct complete over strict text
-   commands carrying the server-issued reference and key, so rejections
-   always carry an explicit reason.
+   notified too (`queuereq:<inbox_id>`). Every queued Telegram draft is
+   dispatched immediately after intake (best-effort auto-dispatch; a
+   dispatch failure never loses the draft -- the row stays queued with
+   backoff for the next sync pass). `/internal/telegram-review-sync`
+   remains only as the retry/backfill path. Reviewers with a linked
+   Telegram identity get the request with Approve/Reject buttons;
+   Approve executes the standard chat-confirm, which builds the verified
+   block inside the database for every kind. Correct and Reject run as
+   guided button flows: Correct asks which field is wrong, then the new
+   value in plain words, then saves once under an idempotent key
+   (`tgflowsave:<inbox_id>`, so double-taps confirm once); Reject asks
+   for a short typed reason. Staff never see UUIDs, request keys, or
+   correction syntax -- buttons carry opaque tokens only. The reporter
+   gets a plain "Approved"/"Rejected" message with a short code they can
+   quote to an administrator.
 5. If Telegram delivery is down, WhatsApp review is unaffected, and
    vice versa: each channel queues and sends independently.
 
@@ -207,6 +214,39 @@ triggers. Validate the keys only after reconciliation:
    rows: leaving a key `NOT VALID` is the safe steady state -- new
    writes stay fully enforced while history is preserved.
 
+## Reversing a wrongly confirmed Telegram draft (audited, append-only)
+
+A confirmed-then-wrong report is never edited or deleted. An authorized
+reviewer (not the reporter -- self-reversal is refused) reverses it with
+`amose_reverse_confirmed_submission`, which appends a `biz_review_reversals`
+row, marks every operational posting from that submission `voided` (new
+offsetting rows where the ledger requires them), and leaves the full audit
+trail intact. The call is idempotent per `p_request_key`: retrying with the
+same key, reference, and reason returns the stored result with
+`is_retry: true`; reusing a key for anything else fails closed.
+
+Safe post-deployment correction for the wrongly posted production sale
+(service role, private session; fill in the real values -- the review
+reference is the `YR-...` code from the draft receipt, the sender is the
+reviewer's linked Telegram chat id, the key must be fresh and unique):
+
+```sql
+select public.amose_reverse_confirmed_submission(
+  '<REVIEW_REF>', 'telegram', '<REVIEWER_CHAT_ID>',
+  'wrong amount posted; reversing per operator runbook',
+  'tg-reverse-<inbox-or-ticket-id>');
+```
+
+Then re-enter the report with the right figures; it flows through the
+normal draft/approve path. Verify afterwards with counts only:
+
+```sql
+select status, count(*) from public.biz_submissions
+ where id = '<SUBMISSION_UUID>' group by 1;
+select count(*) from public.biz_review_reversals
+ where original_submission_id = '<SUBMISSION_UUID>';
+```
+
 ## Privilege matrix (this phase; earlier posture unchanged)
 
 - `biz_telegram_links` / `biz_telegram_callbacks`: RLS ON, no policies;
@@ -216,6 +256,13 @@ triggers. Validate the keys only after reconciliation:
   `amose_queue_telegram_review_requests`, `amose_mint_telegram_callback`,
   `amose_consume_telegram_callback`): `EXECUTE` revoked from
   PUBLIC/anon/authenticated; granted to `service_role` only.
+- Simple-workflow RPCs (`amose_mint_telegram_flow_token`,
+  `amose_consume_telegram_flow_token`, `amose_stage_telegram_flow`,
+  `amose_read_telegram_flows`, `amose_reverse_confirmed_submission`):
+  `EXECUTE` revoked from PUBLIC/anon/authenticated; granted to
+  `service_role` only. The Python adapter may call only the exact RPC
+  names in its per-operation allowlists -- any other `rpc/` path is
+  refused client-side before any request is sent.
 - Plaintext link/button tokens never touch the database (sha256 hex only),
   never appear in logs, replies (except the single issuance response), or
   persisted error notes (type names only).

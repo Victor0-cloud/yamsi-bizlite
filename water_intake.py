@@ -289,6 +289,12 @@ def _parse_sale(text):
         provenance["unit"] = "staff_reported"
         fields["unit_price"] = float(match.group("unit_price"))
         provenance["unit_price"] = "staff_reported"
+        # Optional staff-stated payment method (cash/transfer/pos word).
+        # Absent stays absent: never defaulted, never required.
+        method = _detect_method(text)
+        if method is not None:
+            fields["payment_method"] = method
+            provenance["payment_method"] = "staff_reported"
     else:
         partial = _PARTIAL_SALE.search(text)
         if partial:

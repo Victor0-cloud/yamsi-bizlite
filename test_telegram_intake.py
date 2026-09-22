@@ -155,33 +155,40 @@ class DirectParserTests(unittest.TestCase):
 
 
 class PreviewTests(unittest.TestCase):
-    def test_preview_carries_confirm_correct_cancel(self):
-        extraction = {"kind": "sale", "fields": {"quantity": 50.0,
-            "unit": "bag", "unit_price": 500.0}, "missing_fields": [],
+    def test_preview_is_plain_language_without_keys(self):
+        extraction = {"kind": "sale", "fields": {"quantity": 1.0,
+            "unit": "bag", "unit_price": 450.0,
+            "payment_method": "cash"}, "missing_fields": [],
             "errors": []}
         text = intake.format_intake_preview(
             extraction, review_ref=REF, request_key="tgintake:inbox-1")
-        self.assertIn("Recorded", text)
-        self.assertIn(REF, text)
-        self.assertIn("REVIEW CONFIRM %s KEY tgintake:inbox-1" % REF, text)
-        self.assertIn("CORRECTION", text)
-        self.assertIn("REVIEW REJECT", text)
+        self.assertIn("Saved", text)
+        self.assertIn("1 bag sold for", text)
+        self.assertIn("Waiting for approval.", text)
+        self.assertIn("CANCEL %s" % REF, text)
+        self.assertNotIn("tgintake:inbox-1", text)
+        self.assertNotIn("REVIEW CONFIRM", text)
+        self.assertNotIn("REVIEW REJECT", text)
+        self.assertNotIn("CORRECTION", text)
 
-    def test_preview_names_missing_and_manual_note(self):
+    def test_preview_names_missing_in_plain_words(self):
         extraction = {"kind": "stock",
             "fields": {"total_quantity": 200, "unit": "bag"},
             "missing_fields": ["normal_quantity", "cold_quantity"],
             "errors": ["split not stated"]}
         text = intake.format_intake_preview(
             extraction, queue_note="Administrator review pending.")
-        self.assertIn("Missing: normal_quantity, cold_quantity", text)
+        self.assertIn("Please add:", text)
+        self.assertIn("normal bags", text)
+        self.assertIn("cold bags", text)
+        self.assertNotIn("normal_quantity", text)
         self.assertIn("Administrator review pending.", text)
 
 
 class IntakeFlowHarness(unittest.IsolatedAsyncioTestCase):
     async def _run_text(self, text, identity_rows=None, assignments=None,
             queue_telegram=None, update_id=100, inbox_id="inbox-1",
-            fail_assignments=False):
+            fail_assignments=False, flow_mint=None, flow_stage=None):
         identity_rows = identity_rows if identity_rows is not None else [
             {"tenant_id": TENANT_UUID, "employee_id": EMP_UUID,
                 "business_id": BUSINESS_ID, "branch_id": BRANCH_ID}]
@@ -227,16 +234,31 @@ class IntakeFlowHarness(unittest.IsolatedAsyncioTestCase):
         summary = tg._new_summary()
         update = tg.parse_update(message_update(
             update_id=update_id, text=text))
+        async def no_flow_stage(*args, **kwargs):
+            raise tg.TelegramLinkError("NOT_FOUND: no pending guided step")
+
+        async def ok_flow_mint(ref, flow, sender, **kwargs):
+            return {"token": "tok-%s-%s" % (
+                flow, kwargs.get("branch_id") or "x"),
+                "request_key": "tgflow-1",
+                "result": {"status": "minted"}}
+
         with patch.object(tg, "credentials",
                 return_value=("https://example.supabase.co", "test-key")), \
              patch.object(tg.httpx, "AsyncClient") as factory, \
              patch.object(tg, "queue_telegram_reviews",
                 new_callable=AsyncMock) as queue_mock, \
+             patch.object(tg, "mint_flow_token",
+                new_callable=AsyncMock) as mint_mock, \
+             patch.object(tg, "stage_flow",
+                new_callable=AsyncMock) as stage_mock, \
              patch.object(outbound_telegram_module, "send_message",
                 new_callable=AsyncMock) as send_mock:
             factory.return_value.__aenter__.return_value = client
             queue_mock.side_effect = queue_telegram if queue_telegram \
                 is not None else default_queue
+            mint_mock.side_effect = flow_mint or ok_flow_mint
+            stage_mock.side_effect = flow_stage or no_flow_stage
             outcome = await tg.process_stored_update(
                 update, inbox_id, summary)
         return outcome, summary, client, queue_mock, send_mock, posted
@@ -270,11 +292,12 @@ class ReportTypeTests(IntakeFlowHarness):
         self.assertEqual(
             whatsapp[0].kwargs["json"]["p_request_key"], "queuereq:inbox-1")
         reply = send_mock.call_args.args[1]
-        self.assertIn("Recorded", reply)
-        self.assertIn(REF, reply)
-        self.assertIn("REVIEW CONFIRM", reply)
-        self.assertIn("CORRECTION", reply)
-        self.assertIn("REVIEW REJECT", reply)
+        self.assertIn("Saved", reply)
+        self.assertIn("Waiting for approval.", reply)
+        self.assertIn("CANCEL %s" % REF, reply)
+        self.assertNotIn("REVIEW CONFIRM", reply)
+        self.assertNotIn("CORRECTION", reply)
+        self.assertNotIn("REVIEW REJECT", reply)
         self.assertEqual(
             client.patch.call_args.kwargs["json"], {"status": "processed"})
 
@@ -292,9 +315,10 @@ class ReportTypeTests(IntakeFlowHarness):
                 self.assertEqual(posted[0]["kind"], EXPECTED_KINDS[command])
                 self.assertEqual(summary["intakes_submitted"], 1)
                 reply = send_mock.call_args.args[1]
-                self.assertIn("Recorded", reply)
-                self.assertIn(REF, reply)
-                self.assertIn("REVIEW CONFIRM", reply)
+                self.assertIn("Saved", reply)
+                self.assertIn("Waiting for approval.", reply)
+                self.assertIn("CANCEL %s" % REF, reply)
+                self.assertNotIn("REVIEW CONFIRM", reply)
 
     async def test_production_reuses_shared_extraction_shape(self):
         _, _, _, _, _, posted = await self._run_text(
@@ -345,7 +369,7 @@ class AuthorizationTests(IntakeFlowHarness):
         self.assertEqual(
             client.patch.call_args.kwargs["json"], {"status": "processed"})
 
-    async def test_multibranch_sender_needs_prefix(self):
+    async def test_multibranch_sender_gets_branch_buttons(self):
         outcome, summary, client, queue_mock, send_mock, posted = \
             await self._run_text(EXAMPLES["SALE"], assignments=[
                 {"business_id": BUSINESS_ID, "branch_id": "asaba"},
@@ -354,7 +378,16 @@ class AuthorizationTests(IntakeFlowHarness):
         self.assertEqual(posted, [])
         queue_mock.assert_not_called()
         reply = send_mock.call_args.args[1]
-        self.assertIn("WARRI", reply)
+        self.assertIn("Which branch is this for?", reply)
+        keyboard = send_mock.call_args.kwargs["reply_markup"]
+        labels = [button["text"]
+            for row in keyboard["inline_keyboard"] for button in row]
+        self.assertEqual(sorted(labels), ["Asaba", "Warri"])
+        tokens = [button["callback_data"]
+            for row in keyboard["inline_keyboard"] for button in row]
+        self.assertEqual(len(set(tokens)), 2)
+        for token in tokens:
+            self.assertNotIn(BUSINESS_ID, token)
         self.assertEqual(summary["intake_clarifications"], 1)
 
     async def test_multibranch_prefix_routes_to_named_branch(self):
@@ -409,8 +442,8 @@ class MalformedIncompleteTests(IntakeFlowHarness):
         self.assertEqual(outcome["outcome"], "intake")
         self.assertEqual(posted[0]["kind"], "sale")
         reply = send_mock.call_args.args[1]
-        self.assertIn("Missing:", reply)
-        self.assertIn("quantity", reply)
+        self.assertIn("Please add:", reply)
+        self.assertIn("how many", reply)
 
     async def test_incomplete_deposit_asks_for_missing(self):
         outcome, _, _, _, send_mock, posted = await self._run_text(
@@ -418,8 +451,8 @@ class MalformedIncompleteTests(IntakeFlowHarness):
         self.assertEqual(outcome["outcome"], "intake")
         self.assertEqual(posted[0]["kind"], "bank_deposit")
         reply = send_mock.call_args.args[1]
-        self.assertIn("Missing:", reply)
-        self.assertIn("reference", reply)
+        self.assertIn("Please add:", reply)
+        self.assertIn("deposit slip or transfer reference", reply)
 
 
 class RetryIdempotencyTests(IntakeFlowHarness):
@@ -492,7 +525,8 @@ class ReviewRegressionTests(IntakeFlowHarness):
         self.assertEqual(row, {"id": "inbox-9", "provider": "telegram"})
         self.assertEqual(command.call_args.args[2], CHAT_ID)
         reply = send_mock.call_args.args[1]
-        self.assertIn(REF, reply)
+        self.assertEqual("Approved \u2705", reply)
+        self.assertNotIn(REF, reply)
 
     async def test_review_reject_cancels(self):
         outcome, _, _, command, send_mock = await self._run_command(
@@ -501,7 +535,8 @@ class ReviewRegressionTests(IntakeFlowHarness):
         self.assertEqual(outcome["outcome"], "reject")
         command.assert_called_once()
         reply = send_mock.call_args.args[1]
-        self.assertIn(REF, reply)
+        self.assertEqual("Rejected.", reply)
+        self.assertNotIn(REF, reply)
 
     async def test_malformed_review_prefix_still_refused(self):
         client_posts = []
@@ -536,12 +571,12 @@ class ReviewRegressionTests(IntakeFlowHarness):
 class HelpTextTests(unittest.TestCase):
     def test_start_and_help_show_intake_examples(self):
         self.assertIn("SALE 50 bags at 500 cash", tg.HELP_UNLINKED)
-        self.assertIn("SALE 50 bags at 500 cash", tg.HELP_LINKED)
-        self.assertIn("SALE 50 bags at 500 cash", tg.HELP_LINKED_ORDINARY)
-        self.assertIn("CUSTOMER DEBT Ada 12000", tg.HELP_LINKED_ORDINARY)
-        self.assertIn("STOCK 120 normal bags and 75 cold bags",
-            tg.HELP_LINKED)
-        self.assertIn("REVIEW CONFIRM", tg.HELP_LINKED_ORDINARY)
+        self.assertIn("SALE 1 bag for 450 naira cash", tg.HELP_LINKED)
+        self.assertIn("SALE 1 bag for 450 naira cash",
+            tg.HELP_LINKED_ORDINARY)
+        self.assertIn("CANCEL", tg.HELP_LINKED_ORDINARY)
+        self.assertNotIn("REVIEW CONFIRM", tg.HELP_LINKED_ORDINARY)
+        self.assertIn("Approve, Correct", tg.HELP_LINKED)
 
 
 class SafetyTests(IntakeFlowHarness):
@@ -580,7 +615,10 @@ class SafetyTests(IntakeFlowHarness):
             "amose_mint_telegram_callback",
             "amose_consume_telegram_callback",
             "amose_review_confirm_command", "amose_reject_submission",
-            "amose_confirm_submission"}
+            "amose_confirm_submission",
+            "amose_mint_telegram_flow_token",
+            "amose_consume_telegram_flow_token",
+            "amose_stage_telegram_flow", "amose_read_telegram_flows"}
         for rpc in rpcs:
             self.assertIn(rpc, allowed, "unexpected RPC: " + rpc)
 

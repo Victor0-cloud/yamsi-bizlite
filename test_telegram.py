@@ -533,7 +533,8 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["row"], {"id": "inbox-1", "provider": "telegram"})
         self.assertEqual(seen["sender"], CHAT_ID)
         reply = send_mock.call_args.args[1]
-        self.assertIn(REF, reply)
+        self.assertEqual("Approved \u2705", reply)
+        self.assertNotIn(REF, reply)
         self.assertNotIn("Sold", reply)
 
     async def test_malformed_reserved_prefix_refused_without_writes(self):
@@ -569,10 +570,11 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
                 if c.args[0] == "/rest/v1/biz_submissions"], [])
         self.assertEqual(outcome["outcome"], "help")
         reply = send_mock.call_args.args[1]
-        self.assertIn("linked", reply.lower())
+        self.assertIn("one report per", reply.lower())
+        self.assertIn("SALE", reply)
+        self.assertIn("SALE 1 bag for 450 naira cash", reply)
+        self.assertNotIn("REVIEW", reply)
         self.assertNotIn("not linked", reply.lower())
-        self.assertIn("SALE 50 bags at 500 cash", reply)
-        self.assertIn("REVIEW", reply)
         identity_params = client.get.call_args_list[0].kwargs["params"]
         self.assertEqual(identity_params, {"provider": "eq.telegram",
             "provider_sender": "eq." + CHAT_ID,
@@ -665,12 +667,24 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(CHAT_ID, note.get("processing_error", ""))
         self.assertNotIn("7551230024", note.get("processing_error", ""))
 
-    async def test_start_path_never_queries_sender_identities(self):
+    async def test_start_without_token_sends_connected_when_linked(self):
+        outcome, summary, client, _, _, send_mock = \
+            await self._run_message("/start", identity_rows=[
+                {"tenant_id": TENANT_UUID, "employee_id": EMP_UUID}])
+        self.assertEqual(outcome["outcome"], "help")
+        reply = send_mock.call_args.args[1]
+        self.assertIn("already connected", reply)
+        self.assertNotIn("not linked", reply.lower())
+
+    async def test_start_without_token_asks_link_when_unlinked(self):
         outcome, summary, client, _, _, send_mock = \
             await self._run_message("/start")
-        client.get.assert_not_called()
         self.assertEqual(outcome["outcome"], "help")
-        send_mock.assert_called_once()
+        reply = send_mock.call_args.args[1]
+        self.assertIn("not linked", reply.lower())
+        params = client.get.call_args.kwargs["params"]
+        self.assertEqual(params["provider_sender"], "eq." + CHAT_ID)
+        self.assertNotIn("tenant", " ".join(params.keys()))
 
     async def test_review_command_path_never_queries_sender_identities(self):
         async def fake_command(client, row, sender, command, summary):
@@ -680,9 +694,12 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         text = "REVIEW CONFIRM %s KEY k1" % REF
         outcome, summary, client, _, _, send_mock = \
             await self._run_message(text, command=fake_command)
-        client.get.assert_not_called()
+        paths = [call.args[0] for call in client.get.call_args_list]
+        self.assertNotIn("/rest/v1/biz_sender_identities", paths)
         self.assertEqual(outcome["outcome"], "confirm")
-        send_mock.assert_called_once()
+        reply = send_mock.call_args.args[1]
+        self.assertIn("Approved", reply)
+        self.assertNotIn(REF, reply)
 
     async def test_start_invalid_shape_token_refused_not_stuck(self):
         outcome, summary, client, _, _, send_mock = \
@@ -713,15 +730,27 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
 
 class ProcessCallbackTests(unittest.IsolatedAsyncioTestCase):
     async def _run_callback(self, token="e" * 32, consume=None,
-            confirm=None):
+            confirm=None, flow_consume=None, stage=None):
         client = mock_batch_client()
         summary = tg._new_summary()
         update = tg.parse_update(callback_update(token=token))
+
+        async def no_flow(token, sender):
+            raise tg.TelegramCallbackError(
+                "NOT_FOUND: flow button is not known")
+
+        async def no_stage(*args, **kwargs):
+            raise tg.TelegramLinkError("NOT_FOUND: no pending guided step")
+
         with patch.object(tg, "credentials",
                 return_value=("https://example.supabase.co", "test-key")), \
              patch.object(tg.httpx, "AsyncClient") as factory, \
              patch.object(tg, "consume_button_token",
                 new_callable=AsyncMock) as consume_mock, \
+             patch.object(tg, "consume_flow_token",
+                new_callable=AsyncMock) as flow_mock, \
+             patch.object(tg, "stage_flow",
+                new_callable=AsyncMock) as stage_mock, \
              patch.object(review_service_module, "confirm_from_chat",
                 new_callable=AsyncMock) as confirm_mock, \
              patch.object(outbound_telegram_module, "answer_callback_query",
@@ -735,6 +764,8 @@ class ProcessCallbackTests(unittest.IsolatedAsyncioTestCase):
                 consume_mock.side_effect = consume
             if confirm is not None:
                 confirm_mock.side_effect = confirm
+            flow_mock.side_effect = flow_consume or no_flow
+            stage_mock.side_effect = stage or no_stage
             outcome = await tg._process_callback(
                 client, "inbox-2", update["callback_query"], summary)
         return outcome, summary, client, consume_mock, confirm_mock, \
@@ -824,20 +855,25 @@ class ProcessCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome["outcome"], "refused")
         confirm_mock.assert_not_called()
 
-    async def test_reject_button_sends_instructions_never_rejects(self):
+    async def test_reject_button_starts_reason_flow_never_rejects(self):
         async def ready_reject(token, sender):
             return {"status": "ready", "review_ref": REF, "action": "reject",
                 "request_key": "tgcb-" + token, "is_retry": False}
 
+        async def staged(sender, **kwargs):
+            return {"status": "staged"}
+
         with patch.object(review_service_module, "reject_from_chat",
                 new_callable=AsyncMock) as reject_mock:
             outcome, summary, _, _, _, _, send_mock = \
-                await self._run_callback(consume=ready_reject)
+                await self._run_callback(consume=ready_reject,
+                    stage=staged)
             reject_mock.assert_not_called()
-        self.assertEqual(outcome["outcome"], "reject_instructions")
+        self.assertEqual(outcome["outcome"], "reject_reason_requested")
         reply = send_mock.call_args.args[1]
-        self.assertIn(REF, reply)
-        self.assertIn("REASON", reply)
+        self.assertIn("short reason", reply)
+        self.assertNotIn(REF, reply)
+        self.assertNotIn("KEY", reply)
 
     async def test_unauthorized_actor_refused(self):
         async def ready(token, sender):
@@ -874,18 +910,20 @@ class ProcessCallbackTests(unittest.IsolatedAsyncioTestCase):
             "failed")
 
 
-def queued_row(row_id="out-1", status="queued"):
+def queued_row(row_id="out-1", status="queued", message_type="review_request",
+        key=None):
     return {"id": row_id, "tenant_id": TENANT_UUID,
         "provider_sender": CHAT_ID, "recipient_employee_id": EMP_UUID,
+        "message_type": message_type,
         "message_text": "Review request %s" % REF,
-        "idempotency_key": "tg_review_req:%s:%s:%s"
+        "idempotency_key": key or "tg_review_req:%s:%s:%s"
             % (TENANT_UUID, REF, EMP_UUID),
         "status": status}
 
 
 class DispatchTests(unittest.IsolatedAsyncioTestCase):
     async def _run_dispatch(self, rows, mint=None, send=None,
-            review_ref=None):
+            review_ref=None, flow_mint=None):
         client = mock_batch_client()
 
         async def fake_get(path, params=None):
@@ -899,6 +937,9 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json=[target[0]])
             return httpx.Response(200, json=[])
 
+        async def no_flow_mint(*args, **kwargs):
+            raise tg.TelegramLinkError("NOT_FOUND: flow button is not known")
+
         client.get = AsyncMock(side_effect=fake_get)
         client.patch = AsyncMock(side_effect=fake_patch)
         with patch.object(tg, "credentials",
@@ -906,6 +947,8 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
              patch.object(tg.httpx, "AsyncClient") as factory, \
              patch.object(tg, "mint_button_token",
                 new_callable=AsyncMock) as mint_mock, \
+             patch.object(tg, "mint_flow_token",
+                new_callable=AsyncMock) as flow_mock, \
              patch.object(outbound_telegram_module, "send_message",
                 new_callable=AsyncMock) as send_mock:
             factory.return_value.__aenter__.return_value = client
@@ -916,6 +959,7 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
                     return {"token": "tok-%s" % action,
                         "request_key": "tgcb-tok-%s" % action}
                 mint_mock.side_effect = ok_mint
+            flow_mock.side_effect = flow_mint or no_flow_mint
             if send is not None:
                 send_mock.side_effect = send
             else:
@@ -924,18 +968,29 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         return summary, client, mint_mock, send_mock
 
     async def test_claim_once_send_once_with_buttons(self):
+        async def ok_flow(ref, flow, sender, **kwargs):
+            return {"token": "tok-correct", "request_key": "tgflow-1",
+                "result": {"status": "minted"}}
+
         summary, client, mint_mock, send_mock = \
-            await self._run_dispatch([queued_row()])
+            await self._run_dispatch([queued_row()], flow_mint=ok_flow)
         self.assertEqual(summary, {"scanned": 1, "sent": 1, "failed": 0,
-            "claim_conflicts": 0})
+            "claim_conflicts": 0, "deferred": 0, "retried": 0})
         self.assertEqual(mint_mock.call_count, 2)
         actions = sorted(c.args[1] for c in mint_mock.call_args_list)
         self.assertEqual(actions, ["approve", "reject"])
         keyboard = send_mock.call_args.kwargs["reply_markup"]
         tokens = [b["callback_data"]
             for row in keyboard["inline_keyboard"] for b in row]
-        self.assertEqual(len(tokens), 2)
-        self.assertNotEqual(tokens[0], tokens[1])
+        self.assertEqual(len(tokens), 3)
+        self.assertEqual(len(set(tokens)), 3)
+        labels = [b["text"]
+            for row in keyboard["inline_keyboard"] for b in row]
+        self.assertEqual(labels, ["Approve", "Correct", "Reject"])
+        for token in tokens:
+            self.assertNotIn(REF, token)
+            self.assertNotIn("tgcb", token)
+            self.assertNotIn("tgflow", token)
         sent_patch = [c for c in client.patch.call_args_list
             if c.kwargs["json"].get("status") == "sent"]
         self.assertEqual(len(sent_patch), 1)
@@ -956,19 +1011,54 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         mint_mock.assert_not_called()
         send_mock.assert_not_called()
 
-    async def test_send_outage_marks_failed_for_operator_retry(self):
+    async def test_send_outage_requeues_with_backoff_for_retry(self):
         async def down(chat_id, text, reply_markup=None):
             raise outbound_telegram_module.OutboundUnavailable("no token")
 
         summary, client, _, send_mock = await self._run_dispatch(
             [queued_row()], send=down)
-        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["retried"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["sent"], 0)
         send_mock.assert_called_once()
+        requeued = [c for c in client.patch.call_args_list
+            if c.kwargs["json"].get("status") == "queued"]
+        self.assertEqual(len(requeued), 1)
+        body = requeued[0].kwargs["json"]
+        self.assertEqual(body["attempt_count"], 1)
+        self.assertIn("next_attempt_at", body)
+        self.assertNotIn(BOT_TOKEN, body.get("failure_reason", ""))
+
+    async def test_send_outage_fails_terminally_after_max_attempts(self):
+        async def down(chat_id, text, reply_markup=None):
+            raise outbound_telegram_module.OutboundUnavailable("no token")
+
+        row = queued_row()
+        row["attempt_count"] = 4
+        summary, client, _, send_mock = await self._run_dispatch(
+            [row], send=down)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["retried"], 0)
         failed = [c for c in client.patch.call_args_list
             if c.kwargs["json"].get("status") == "failed"]
         self.assertEqual(len(failed), 1)
-        reason = failed[0].kwargs["json"]["failure_reason"]
-        self.assertNotIn(BOT_TOKEN, reason)
+        self.assertEqual(failed[0].kwargs["json"]["attempt_count"], 5)
+
+    async def test_future_retry_row_is_deferred_not_sent(self):
+        row = queued_row()
+        row["next_attempt_at"] = "2999-01-01T00:00:00+00:00"
+        summary, _, _, send_mock = await self._run_dispatch([row])
+        self.assertEqual(summary, {"scanned": 1, "sent": 0, "failed": 0,
+            "claim_conflicts": 0, "deferred": 1, "retried": 0})
+        send_mock.assert_not_called()
+
+    async def test_reporter_ack_dispatch_sends_plain_text(self):
+        row = queued_row(message_type="review_confirmed",
+            key="review_ack:%s:tgintake:inbox-9" % TENANT_UUID)
+        row["message_text"] = "Approved \u2705\n1 bag sold."
+        summary, _, _, send_mock = await self._run_dispatch([row])
+        self.assertEqual(summary["sent"], 1)
+        self.assertIsNone(send_mock.call_args.kwargs["reply_markup"])
 
     async def test_mint_refusal_for_reject_still_sends_approve_only(self):
         async def selective(ref, action, sender):
@@ -1036,7 +1126,9 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
                 return_value={"scanned": 1}) as dispatch:
             summary = await tg.sync_submission_reviews(
                 SUBMISSION_UUID, "tgsync-1")
-            dispatch.assert_called_once_with(review_ref=REF)
+            self.assertEqual(dispatch.call_count, 2)
+            dispatch.assert_any_call(review_ref=REF)
+            dispatch.assert_any_call(limit=20)
         self.assertEqual(summary["queue_status"], "queued")
 
 
@@ -1182,7 +1274,10 @@ class ChannelBoundaryTests(unittest.TestCase):
             "amose_mint_telegram_callback",
             "amose_consume_telegram_callback",
             "amose_review_confirm_command", "amose_reject_submission",
-            "amose_confirm_submission"}
+            "amose_confirm_submission",
+            "amose_mint_telegram_flow_token",
+            "amose_consume_telegram_flow_token",
+            "amose_stage_telegram_flow", "amose_read_telegram_flows"}
         for rpc in rpcs:
             self.assertIn(rpc, allowed, "unexpected RPC reference: " + rpc)
 

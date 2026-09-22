@@ -318,110 +318,158 @@ def parse_customer_debt(remainder):
     return result
 
 
-def _describe_amount(kobo):
-    if isinstance(kobo, bool) or not isinstance(kobo, int):
-        return "?"
-    return "%d" % (kobo // 100) if kobo % 100 == 0 else "%.2f" % (kobo / 100.0)
+def _format_naira_simple(amount_naira):
+    """Whole-naira display for staff messages (e.g. 450 -> ₦450)."""
+    try:
+        return "₦{:,.0f}".format(float(amount_naira))
+    except (TypeError, ValueError):
+        return None
 
 
-_KIND_TITLES = {
-    "sale": "Sale",
-    "production": "Production",
-    "expense": "Expense",
-    "bank_deposit": "Bank deposit",
-    "payment": "Payment",
-    "stock": "Stock count",
-    "customer_payment": "Customer payment",
-    "customer_debt": "Customer debt",
-}
+def _plural_unit(quantity, unit):
+    """'1 bag' vs '50 bags': singular only for exactly one."""
+    word = (unit or "units").strip() or "units"
+    try:
+        one = float(quantity) == 1
+    except (TypeError, ValueError):
+        one = False
+    if one and word.endswith("s"):
+        return word[:-1]
+    if not one and not word.endswith("s"):
+        return word + "s"
+    return word
+
+
+def _simple_missing_name(field):
+    """Plain words for a missing field, fit for market staff."""
+    return {
+        "quantity": "how many",
+        "unit": "unit (for example: bag)",
+        "unit_price": "price",
+        "amount_kobo": "amount",
+        "method": "payment type (cash, transfer or pos)",
+        "payment_method": "payment type (cash, transfer or pos)",
+        "customer_name": "customer name",
+        "customer_id": "customer",
+        "category": "what it was for",
+        "description": "description",
+        "sale_ref": "which sale this pays for",
+        "good_quantity": "good bags",
+        "destination_account": "where it was deposited",
+        "reference": "deposit slip or transfer reference",
+        "depositor_name": "who deposited it",
+        "from_name": "who handed it over",
+        "to_name": "who received it",
+        "normal_quantity": "normal bags",
+        "cold_quantity": "cold bags",
+    }.get(field, field.replace("_", " "))
+
+
+def _simple_sale_line(fields):
+    """'1 bag sold for ₦450 cash.' or None when details are missing."""
+    try:
+        quantity = float(fields.get("quantity"))
+        unit = str(fields.get("unit") or "").strip()
+        unit_price = float(fields.get("unit_price"))
+    except (TypeError, ValueError):
+        return None
+    if not unit:
+        return None
+    amount = _format_naira_simple(unit_price)
+    if amount is None:
+        return None
+    method = str(fields.get("payment_method") or "").strip().lower()
+    tail = " %s" % method if method in ("cash", "transfer", "pos") else ""
+    if float(quantity) == int(quantity):
+        shown = "%d" % int(quantity)
+    else:
+        shown = "%g" % quantity
+    return "%s %s sold for %s%s." % (
+        shown, _plural_unit(quantity, unit), amount, tail)
+
+
+def _simple_kobo_line(fields, key="amount_kobo"):
+    """Whole-naira display of a true-kobo integer field, or None."""
+    try:
+        return _format_naira_simple(int(fields.get(key)) / 100)
+    except (TypeError, ValueError):
+        return None
 
 
 def summarize_extraction(extraction):
-    """One-line human summary of parsed fields (no identifiers)."""
-    kind = (extraction or {}).get("kind")
+    """Short plain summary of an extraction result for chat feedback."""
+    kind = (extraction or {}).get("kind") or "report"
     fields = (extraction or {}).get("fields") or {}
-    title = _KIND_TITLES.get(kind, "Report")
     if kind == "sale":
-        return "%s: %s %s at %s%s" % (title,
-            fields.get("quantity", "?"), fields.get("unit", "units"),
-            fields.get("unit_price", "?"),
-            " (%s)" % fields["payment_method"]
-            if fields.get("payment_method") else "")
+        line = _simple_sale_line(fields)
+        return line if line else "Sale needs more detail."
     if kind == "production":
-        return "%s: %s good bags" % (title,
-            fields.get("good_quantity", "?"))
+        try:
+            return "%d bags produced." % int(
+                float(fields.get("good_quantity")))
+        except (TypeError, ValueError):
+            return "Production report needs more detail."
     if kind == "expense":
-        return "%s: %s on %s%s" % (title,
-            _describe_amount(fields.get("amount_kobo")),
-            fields.get("description") or fields.get("category", "?"),
-            " (%s)" % fields["payment_method"]
-            if fields.get("payment_method") else "")
+        amount = _simple_kobo_line(fields)
+        if amount is None:
+            return "Expense needs more detail."
+        category = str(fields.get("category") or "spending").strip()
+        return "%s spent on %s." % (amount, category)
     if kind == "bank_deposit":
-        return "%s: %s%s%s" % (title,
-            _describe_amount(fields.get("amount_kobo")),
-            " to %s" % fields["destination_account"]
-            if fields.get("destination_account") else "",
-            " ref %s" % fields["reference"]
-            if fields.get("reference") else "")
+        amount = _simple_kobo_line(fields)
+        return "%s deposited." % amount if amount else \
+            "Deposit needs more detail."
     if kind == "payment":
-        return "%s: %s%s for sale %s" % (title,
-            _describe_amount(fields.get("amount_kobo")),
-            " (%s)" % fields["method"] if fields.get("method") else "",
-            fields.get("sale_ref", "?"))
+        amount = _simple_kobo_line(fields)
+        return "%s received." % amount if amount else \
+            "Payment needs more detail."
     if kind == "customer_payment":
-        who = fields.get("customer_name") or "?"
-        return "%s: %s paid %s%s" % (title, who,
-            _describe_amount(fields.get("amount_kobo")),
-            " (%s)" % fields["method"] if fields.get("method") else "")
+        amount = _simple_kobo_line(fields)
+        if amount is None:
+            return "Customer payment needs more detail."
+        who = str(fields.get("customer_name") or "").strip()
+        if who:
+            return "%s paid %s." % (who, amount)
+        return "%s received." % amount
+    if kind == "cash_handover":
+        amount = _simple_kobo_line(fields)
+        return "%s handed over." % amount if amount else \
+            "Handover needs more detail."
     if kind == "stock":
-        parts = []
-        if "normal_quantity" in fields:
-            parts.append("%s normal" % fields["normal_quantity"])
-        if "cold_quantity" in fields:
-            parts.append("%s cold" % fields["cold_quantity"])
-        detail = " and ".join(parts) if parts else \
-            ("total %s" % fields.get("total_quantity", "?"))
-        return "%s: %s bags" % (title, detail)
+        try:
+            return "%d normal and %d cold bags counted." % (
+                int(fields.get("normal_quantity")),
+                int(fields.get("cold_quantity")))
+        except (TypeError, ValueError):
+            return "Stock count needs more detail."
     if kind == "customer_debt":
-        return "%s: %s owes %s" % (title,
-            fields.get("customer_name", "?"),
-            _describe_amount(fields.get("amount_kobo")))
-    return title
-
-
-REVIEW_ACTIONS_HELP = (
-    "Reviewer actions (existing workflow only): "
-    "Confirm with REVIEW CONFIRM {ref} KEY {key}; "
-    "correct values with REVIEW CONFIRM {ref} KEY {key} "
-    "CORRECTION field=value -- <reason>; "
-    "reject with REVIEW REJECT {ref} KEY {key} REASON <reason>. "
-    "Withdraw your own pending draft with CANCEL {ref}.")
+        amount = _simple_kobo_line(fields)
+        if amount is None:
+            return "Customer debt needs more detail."
+        who = str(fields.get("customer_name") or "").strip()
+        if who:
+            return "%s owes %s." % (who, amount)
+        return "%s owed." % amount
+    return "%s recorded." % kind.replace("_", " ").capitalize()
 
 
 def format_intake_preview(extraction, review_ref=None, request_key=None,
         queue_note=None):
-    """Builds the sender-facing preview reply for one parsed report.
+    """Staff receipt for a saved draft, in plain market language.
 
-    Shows the parsed summary back, names anything missing, and points to
-    the existing Confirm / Correct / Cancel review commands when a
-    review reference was issued. Carries no identifiers, tokens, or
-    message contents beyond the sender's own report summary."""
-    lines = ["Recorded: " + summarize_extraction(extraction) + "."]
+    No UUIDs, idempotency keys, or database terms. The only reference
+    shown is the draft's own short review reference, and only so the
+    reporter can withdraw their own draft with CANCEL."""
+    summary = summarize_extraction(extraction)
     missing = (extraction or {}).get("missing_fields") or []
+    lines = ["Saved \u2705", summary]
     if missing:
-        lines.append("Missing: %s. Send the missing detail in a new "
-            "message." % ", ".join(missing[:8]))
-    if review_ref and request_key:
-        lines.append("Draft %s is awaiting reviewer decision."
-            % review_ref)
-        lines.append(REVIEW_ACTIONS_HELP.format(
-            ref=review_ref, key=request_key))
-    elif queue_note:
+        simple = [_simple_missing_name(field) for field in missing[:8]]
+        lines.append("Please add: %s." % ", ".join(simple))
+    lines.append("Waiting for approval.")
+    if review_ref:
+        lines.append(
+            "To take back this draft, reply: CANCEL %s" % review_ref)
+    if queue_note:
         lines.append(queue_note)
-    else:
-        lines.append("This draft is awaiting reviewer decision; a "
-            "reviewer will confirm, correct, or reject it.")
-    lines.append("To fix a typo, simply send the report again with the "
-        "right details.")
-    text = " ".join(lines)
-    return text[:1500]
+    return "\n".join(lines)[:1500]

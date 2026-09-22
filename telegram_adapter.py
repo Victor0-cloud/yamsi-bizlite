@@ -77,6 +77,46 @@ CONSUME_LINK_RPC = "amose_consume_telegram_link"
 QUEUE_RPC = "amose_queue_telegram_review_requests"
 MINT_RPC = "amose_mint_telegram_callback"
 CONSUME_RPC = "amose_consume_telegram_callback"
+FLOW_MINT_RPC = "amose_mint_telegram_flow_token"
+FLOW_CONSUME_RPC = "amose_consume_telegram_flow_token"
+FLOW_STAGE_RPC = "amose_stage_telegram_flow"
+FLOW_READ_RPC = "amose_read_telegram_flows"
+FLOW_MINT_ALLOWLIST = frozenset({FLOW_MINT_RPC})
+FLOW_CONSUME_ALLOWLIST = frozenset({FLOW_CONSUME_RPC})
+FLOW_STAGE_ALLOWLIST = frozenset({FLOW_STAGE_RPC})
+FLOW_READ_ALLOWLIST = frozenset({FLOW_READ_RPC})
+FLOW_EXPIRY_DAYS = 3
+FLOW_VALUE_LIMIT = 200
+
+# Guided-correction fields per submission kind. Every entry must stay
+# inside the database corrections allowlist; the confirm RPC still
+# validates finally and fails closed on anything else.
+CORRECTABLE_FIELDS = {
+    "sale": ("quantity", "unit_price", "unit"),
+    "production": ("good_quantity", "rejected_quantity"),
+    "poultry_daily_report": ("good_quantity", "rejected_quantity"),
+    "payment": ("amount_kobo", "method"),
+    "expense": ("amount_kobo", "category"),
+    "bank_deposit": ("amount_kobo",),
+    "cash_handover": ("amount_kobo",),
+    "stock": ("normal_quantity", "cold_quantity"),
+    "customer_payment": ("amount_kobo", "method"),
+    "customer_debt": ("amount_kobo",),
+}
+FIELD_LABELS = {
+    "quantity": "Quantity",
+    "unit_price": "Price",
+    "unit": "Unit",
+    "amount_kobo": "Amount",
+    "method": "Payment type",
+    "payment_method": "Payment type",
+    "good_quantity": "Good bags",
+    "rejected_quantity": "Rejected bags",
+    "category": "What it was for",
+    "normal_quantity": "Normal bags",
+    "cold_quantity": "Cold bags",
+}
+GUIDED_CORRECTION_REASON = "Reviewer-guided correction via Telegram buttons"
 
 ISSUE_LINK_ALLOWLIST = frozenset({ISSUE_LINK_RPC})
 CONSUME_LINK_ALLOWLIST = frozenset({CONSUME_LINK_RPC})
@@ -95,50 +135,31 @@ HELP_UNLINKED = (
     "Once linked, send staff reports such as SALE 50 bags at 500 cash.")
 
 HELP_LINKED = (
-    "YAMSI linked: send staff reports here, one report per message. "
-    "Examples: SALE 50 bags at 500 cash; "
-    "PRODUCTION 225 bags used 7kg nylon; EXPENSE fuel 15000; "
-    "DEPOSIT 80000 bank transfer; STOCK 120 normal bags and 75 cold bags; "
-    "CUSTOMER PAYMENT Emeka 25000 transfer; CUSTOMER DEBT Ada 12000. "
-    "You will also receive review requests here. Reviewers confirm with "
-    "the Approve button, or reply "
-    "REVIEW CONFIRM <reference> KEY <key> "
-    "[CORRECTION <reason>], or "
-    "REVIEW REJECT <reference> KEY <key> REASON <reason>.")
+    "Send one report per message, e.g. SALE 1 bag for 450 naira cash. "
+    "You will also receive review requests here: tap Approve, Correct "
+    "or Reject on the report message.")
 
 HELP_LINKED_ORDINARY = (
-    "YAMSI linked: send staff reports here, one report per message. "
-    "Examples: SALE 50 bags at 500 cash; "
-    "PRODUCTION 225 bags used 7kg nylon; EXPENSE fuel 15000; "
-    "DEPOSIT 80000 bank transfer; STOCK 120 normal bags and 75 cold bags; "
-    "CUSTOMER PAYMENT Emeka 25000 transfer; CUSTOMER DEBT Ada 12000. "
-    "Incomplete reports will ask for the missing detail. Reviewers decide "
-    "with REVIEW CONFIRM <reference> KEY <key> [CORRECTION <reason>] or "
-    "REVIEW REJECT <reference> KEY <key> REASON <reason>. "
-    "Correct a value with CORRECTION field=value (e.g. CORRECTION "
-    "amount=25000). Withdraw your own pending draft with "
-    "CANCEL <reference>.")
+    "Send one report per message, e.g. SALE 1 bag for 450 naira cash. "
+    "If we need more detail, we will ask. "
+    "To take back your own draft, reply CANCEL and the code from "
+    "your receipt.")
+CONNECTED_LINKED = (
+    "You are already connected. Send one report per message, "
+    "e.g. SALE 1 bag for 450 naira cash.")
 
 HELP_NO_ASSIGNMENT = (
-    "YAMSI: this Telegram account is linked but has no branch assignment "
+    "This Telegram account is linked but has no branch assignment "
     "yet. Ask your administrator to assign you a branch, then send your "
-    "report (e.g. SALE 50 bags at 500 cash).")
+    "report (e.g. SALE 1 bag for 450 naira cash).")
 
 INTAKE_UNSUPPORTED = (
     "Could not recognize a report in your message. Send one report per "
     "message, starting with one of: SALE, PRODUCTION, EXPENSE, DEPOSIT, "
     "STOCK, CUSTOMER PAYMENT, CUSTOMER DEBT. "
-    "E.g. SALE 50 bags at 500 cash.")
+    "E.g. SALE 1 bag for 450 naira cash.")
 
-_INTAKE_EXAMPLE_HINT = "SALE 50 bags at 500 cash"
-
-REJECT_INSTRUCTIONS = (
-    "To reject, reply with: REVIEW REJECT {ref} KEY {key} REASON <reason>. "
-    "The reason is required and is recorded with the rejection.")
-
-CORRECT_INSTRUCTIONS = (
-    "To correct, reply with: REVIEW CONFIRM {ref} KEY {key} "
-    "CORRECTION <reason>.")
+_INTAKE_EXAMPLE_HINT = "SALE 1 bag for 450 naira cash"
 
 
 class TelegramAdapterError(Exception):
@@ -282,10 +303,28 @@ def callback_parts(callback_query):
     return query_id, clean_sender, chat_id, message_id, data.strip()
 
 
-def review_keyboard(approve_token, reject_token):
-    return {"inline_keyboard": [
-        [{"text": "Approve", "callback_data": approve_token}],
-        [{"text": "Reject", "callback_data": reject_token}]]}
+DISPATCHABLE_TYPES = ("review_request", "review_confirmed",
+    "review_rejected", "review_cancelled")
+TG_DISPATCH_MAX_ATTEMPTS = 5
+
+
+def review_keyboard(approve_token, reject_token, correct_token=None):
+    buttons = [[{"text": "Approve", "callback_data": approve_token}]]
+    if correct_token is not None:
+        buttons.append([{"text": "Correct", "callback_data": correct_token}])
+    buttons.append([{"text": "Reject", "callback_data": reject_token}])
+    return {"inline_keyboard": buttons}
+
+
+def _retry_delay_minutes(attempts):
+    """5/15/45/135-minute backoff capped at 4 hours, mirroring the
+    WhatsApp dispatcher shape for Telegram rows."""
+    return min(5 * (3 ** max(0, attempts - 1)), 240)
+
+
+def _dispatch_summary():
+    return {"scanned": 0, "sent": 0, "failed": 0, "claim_conflicts": 0,
+        "deferred": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +551,97 @@ async def consume_button_token(token, sender):
     return result
 
 
+def _flow_expiry():
+    return (datetime.now(timezone.utc) + timedelta(
+        days=FLOW_EXPIRY_DAYS)).isoformat()
+
+
+async def mint_flow_token(review_ref, flow, sender, field=None,
+        business_id=None, branch_id=None, request_key=None):
+    """Mints one guided-flow button token via the service-role RPC.
+
+    review_ref is None only for branch-choice buttons. Raises
+    TelegramLinkError on authorization/validation refusals so callers
+    answer with a refusal instead of a delivery retry."""
+    key = request_key or ("tgflow:%s" % uuid.uuid4().hex)
+    token = new_callback_token()
+    payload = {"p_token_hash": sha256_hex(token),
+        "p_reviewer_provider": PROVIDER, "p_reviewer_sender": sender,
+        "p_review_ref": review_ref, "p_flow": flow, "p_field": field,
+        "p_business": business_id, "p_branch": branch_id,
+        "p_request_key": key, "p_expires_at": _flow_expiry()}
+    try:
+        result = await _call_rpc(
+            FLOW_MINT_RPC, FLOW_MINT_ALLOWLIST, payload)
+    except human_confirmation.WorkflowDatabaseError:
+        raise
+    except human_confirmation.WorkflowError as error:
+        raise TelegramLinkError(str(error)) from None
+    if not isinstance(result, dict) or result.get("status") != "minted":
+        raise human_confirmation.WorkflowDatabaseError(
+            "Review RPC returned unexpected status")
+    return {"token": token, "request_key": key, "result": result}
+
+
+async def consume_flow_token(token, sender):
+    """Consumes one guided-flow button press; validates terminal state."""
+    if not isinstance(token, str) or not TOKEN_RE.match(token.strip()):
+        raise TelegramCallbackError("Callback data is not valid")
+    clean_sender = _require_sender_id(sender)
+    try:
+        result = await _call_rpc(FLOW_CONSUME_RPC, FLOW_CONSUME_ALLOWLIST, {
+            "p_token_hash": sha256_hex(token.strip()),
+            "p_reviewer_provider": PROVIDER,
+            "p_reviewer_sender": clean_sender})
+    except human_confirmation.WorkflowDatabaseError:
+        raise
+    except human_confirmation.WorkflowError as error:
+        raise TelegramCallbackError(str(error)) from None
+    if not isinstance(result, dict) or result.get("status") not in (
+            "ready", "already_used", "case_closed", "expired"):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Review RPC returned unexpected status")
+    return result
+
+
+async def stage_flow(sender, review_ref=None, flow=None, field=None,
+        value_text=None, clear=False, take=False, request_key=None,
+        business_id=None, branch_id=None):
+    """Stages, reads, takes, or clears one pending guided-flow input."""
+    key = request_key or ("tgflow:%s" % uuid.uuid4().hex)
+    try:
+        result = await _call_rpc(FLOW_STAGE_RPC, FLOW_STAGE_ALLOWLIST, {
+            "p_reviewer_provider": PROVIDER,
+            "p_reviewer_sender": sender,
+            "p_review_ref": review_ref, "p_flow": flow, "p_field": field,
+            "p_value_text": value_text, "p_clear": bool(clear),
+            "p_take": bool(take), "p_request_key": key,
+            "p_business": business_id, "p_branch": branch_id})
+    except human_confirmation.WorkflowDatabaseError:
+        raise
+    except human_confirmation.WorkflowError as error:
+        raise TelegramLinkError(str(error)) from None
+    if not isinstance(result, dict) or result.get("status") not in (
+            "staged", "taken", "cleared"):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Review RPC returned unexpected status")
+    return result
+
+
+async def read_flows(sender):
+    """Lists the sender's own live pending flows, or [] for unknown
+    senders. Transport failures raise fail-closed."""
+    clean_sender = _require_sender_id(sender)
+    result = await _call_rpc(FLOW_READ_RPC, FLOW_READ_ALLOWLIST, {
+        "p_reviewer_provider": PROVIDER,
+        "p_reviewer_sender": clean_sender})
+    if not isinstance(result, dict) or result.get("status") != "ok" \
+            or not isinstance(result.get("flows"), list):
+        raise human_confirmation.WorkflowDatabaseError(
+            "Review RPC returned unexpected status")
+    return result["flows"]
+
+
 # ---------------------------------------------------------------------------
 # Inbox status + outbound dispatch over the shared REST helpers.
 # ---------------------------------------------------------------------------
@@ -730,6 +860,80 @@ def _extract_intake(command, remainder, business_id, branch_id):
     return extraction
 
 
+def _branch_label(business_id, branch_id, duplicates):
+    label = (branch_id or "").replace("_", " ").strip().title()
+    if not label:
+        label = "Branch"
+    if branch_id in duplicates:
+        label = "%s (%s)" % (label,
+            (business_id or "").replace("_", " ").strip().title())
+    return label[:32]
+
+
+def _branch_prompt(candidates):
+    if not candidates:
+        return HELP_NO_ASSIGNMENT
+    branches = sorted({branch for _, branch in candidates})
+    return "Which branch is this for? Reply with the branch first, " \
+        "e.g. %s: SALE 1 bag for 450 naira cash." % branches[0].upper()
+
+
+async def _take_pending_branch(sender):
+    """Consumes a stored branch choice, or returns None when absent.
+
+    Unknown senders, missing choices, and lookup failures all fall back
+    to the branch buttons: no draft is ever created from a guessed
+    branch, and a genuine outage still fails closed at draft creation."""
+    try:
+        taken = await stage_flow(sender, take=True)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError):
+        return None
+    business_id = taken.get("business_id")
+    branch_id = taken.get("field") or taken.get("branch_id")
+    if not business_id or not branch_id:
+        return None
+    return business_id, branch_id
+
+
+async def _send_branch_choice(summary, client, chat_id, sender,
+        candidates):
+    """Asks a multi-branch sender to choose, with one button per branch.
+
+    Buttons are opaque bound tokens; a press stores the choice for the
+    sender's next message. Mint failures fall back to the text prompt --
+    the draft is never created from a guessed branch."""
+    ordered = sorted(candidates)
+    seen = {}
+    for business_id, branch_id in ordered:
+        seen.setdefault(branch_id, 0)
+        seen[branch_id] += 1
+    duplicates = {branch for branch, count in seen.items() if count > 1}
+    buttons = []
+    for business_id, branch_id in ordered:
+        try:
+            minted = await mint_flow_token(None, "report_branch", sender,
+                field=branch_id, business_id=business_id,
+                branch_id=branch_id)
+        except (TelegramLinkError,
+                human_confirmation.WorkflowDatabaseError,
+                human_confirmation.WorkflowError):
+            minted = None
+        if minted is None:
+            continue
+        buttons.append([{"text": _branch_label(
+            business_id, branch_id, duplicates),
+            "callback_data": minted["token"]}])
+    text = "Which branch is this for?"
+    if not buttons:
+        text = _branch_prompt(candidates)
+        await _send_best_effort(summary, chat_id, text, "help_sent")
+        return
+    await _send_best_effort(summary, chat_id, text, "help_sent",
+        reply_markup={"inline_keyboard": buttons})
+
+
 async def _process_intake(client, inbox_id, sender, chat_id, text, summary):
     """Full staff-report intake for one linked sender's message.
 
@@ -757,15 +961,27 @@ async def _process_intake(client, inbox_id, sender, chat_id, text, summary):
     elif candidates:
         resolved = message_processor._resolve_multi_assignment(
             candidates, text)
-        if resolved is None:
-            await _send_best_effort(summary, chat_id,
-                message_processor._clarification_text(candidates),
-                "help_sent")
-            await _set_inbox_status(client, inbox_id, "processed")
-            summary["unmatched"] += 1
-            summary["intake_clarifications"] += 1
-            return {"outcome": "help"}
-        (business_id, branch_id), report_text = resolved
+        if resolved is not None:
+            (business_id, branch_id), report_text = resolved
+        else:
+            # A stored branch choice applies only to a real report
+            # attempt (an intake command); anything else keeps the
+            # choice for later and gets the branch prompt.
+            pending_branch = None
+            command_hint, _ = telegram_intake.detect_command(text)
+            if command_hint is not None:
+                pending_branch = await _take_pending_branch(sender)
+            if pending_branch is not None \
+                    and pending_branch in candidates:
+                business_id, branch_id = pending_branch
+                report_text = text
+            else:
+                await _send_branch_choice(
+                    summary, client, chat_id, sender, candidates)
+                await _set_inbox_status(client, inbox_id, "processed")
+                summary["unmatched"] += 1
+                summary["intake_clarifications"] += 1
+                return {"outcome": "help"}
     else:
         await _send_best_effort(summary, chat_id, HELP_NO_ASSIGNMENT,
             "help_sent")
@@ -823,6 +1039,19 @@ async def _process_intake(client, inbox_id, sender, chat_id, text, summary):
             client, submission_id, "queuereq:" + inbox_id)
     except (human_confirmation.WorkflowError, DatabaseUnavailable):
         summary["intake_queue_failed"] += 1
+    # Automatic dispatch: the durable outbox stays the source of truth,
+    # but normal reports must not wait for a manual sync. Best-effort
+    # only -- the draft above is already saved, so a dispatch failure
+    # can never roll it back or duplicate it; failed rows stay queued
+    # with backoff for the next pass. Duplicate webhook deliveries are
+    # safe: claiming is conditional and idempotent.
+    if review_ref is not None:
+        try:
+            auto = await dispatch_queued(review_ref=review_ref)
+            summary["notifications_sent"] += auto.get("sent", 0)
+            summary["notifications_failed"] += auto.get("failed", 0)
+        except Exception:
+            summary["intake_queue_failed"] += 1
     if review_ref is None and queue_note is None:
         queue_note = ("Draft recorded; an administrator will follow up.")
     await _send_best_effort(summary, chat_id,
@@ -874,8 +1103,12 @@ async def _process_message(client, inbox_id, message, summary):
             summary["reviews_refused"] += 1
             return {"outcome": "refused", "error": "TelegramAdapterError"}
         if token is None:
-            await _send_best_effort(summary, chat_id,
-                HELP_UNLINKED, "help_sent")
+            if await _is_linked_sender(client, sender):
+                await _send_best_effort(summary, chat_id,
+                    CONNECTED_LINKED, "help_sent")
+            else:
+                await _send_best_effort(summary, chat_id,
+                    HELP_UNLINKED, "help_sent")
             await _set_inbox_status(client, inbox_id, "processed")
             return {"outcome": "help"}
         try:
@@ -911,14 +1144,18 @@ async def _process_message(client, inbox_id, message, summary):
             outcome = await review_service.handle_review_command(
                 client, row, sender, command, summary)
             status_word = outcome.get("outcome")
-            if status_word in ("confirm", "reject"):
-                reply = "Recorded %s for %s." % (
-                    status_word, command.get("review_ref"))
-                await _send_best_effort(summary, chat_id, reply, "help_sent")
+            if status_word == "confirm":
+                await _send_best_effort(summary, chat_id, "Approved \u2705",
+                    "help_sent")
+                await _auto_dispatch_best_effort(summary)
+            elif status_word == "reject":
+                await _send_best_effort(summary, chat_id, "Rejected.",
+                    "help_sent")
+                await _auto_dispatch_best_effort(summary)
             elif status_word == "refused":
                 await _send_best_effort(summary, chat_id,
-                    "Refused (%s). Send /start for command help."
-                    % outcome.get("error"), "help_sent")
+                    "Sorry, that command did not work. Send /start "
+                    "for help.", "help_sent")
             return outcome
         await review_service.refuse_malformed_command(client, row, summary)
         await _send_best_effort(summary, chat_id,
@@ -936,8 +1173,143 @@ async def _process_message(client, inbox_id, message, summary):
         return await _process_cancel(
             client, inbox_id, sender, chat_id, cancel, summary)
 
+    # Guided-flow answers: ordinary text following a menu prompt is a
+    # staged value or reason, never a new report. Explicit commands keep
+    # precedence (handled above); intake commands below start fresh
+    # reports and leave pending flows to expire.
+    flow_answer = await _maybe_answer_flow(
+        client, inbox_id, sender, chat_id, text, summary)
+    if flow_answer is not None:
+        return flow_answer
+
     return await _process_intake(
         client, inbox_id, sender, chat_id, text, summary)
+
+
+async def _maybe_answer_flow(client, inbox_id, sender, chat_id, text,
+        summary):
+    """Routes one ordinary text message into a pending guided step.
+
+    Returns None when the sender has no pending decision flow (normal
+    intake continues) or when the text is itself an intake command (a
+    fresh report wins over the pending prompt)."""
+    command_hint, _ = telegram_intake.detect_command(text or "")
+    if command_hint is not None:
+        return None
+    # Best-effort only: any lookup failure falls through to ordinary
+    # intake, which fails closed on its own when the database is down.
+    # A value that misses its prompt can never create a draft -- plain
+    # non-command text only ever reaches the help reply.
+    try:
+        flows = await read_flows(sender)
+    except Exception:
+        return None
+    pending = [flow for flow in flows if flow.get("review_ref")]
+    if not pending:
+        return None
+    flow = pending[0]
+    review_ref = flow.get("review_ref")
+    kind = flow.get("submission_kind")
+    if flow.get("flow") == "reject":
+        return await _answer_reject_reason(
+            client, inbox_id, sender, chat_id, review_ref, text, summary)
+    if flow.get("flow") != "correct" or not flow.get("field"):
+        await _send_best_effort(summary, chat_id,
+            "Tap what is wrong above to continue.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        return {"outcome": "flow_nudge"}
+    value = _validate_flow_value(kind, flow.get("field"), text)
+    if value is None:
+        await _send_best_effort(summary, chat_id,
+            _ask_for_value(kind, flow.get("field")), "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        return {"outcome": "flow_value_invalid"}
+    try:
+        staged = await stage_flow(sender, review_ref=review_ref,
+            value_text=value)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError) as error:
+        if isinstance(error, human_confirmation.WorkflowDatabaseError):
+            await _set_inbox_status(client, inbox_id, "failed",
+                _failure_note(error))
+            summary["failed"] += 1
+            return {"outcome": "failed",
+                "error": type(error).__name__}
+        await _send_best_effort(summary, chat_id,
+            _ask_for_value(kind, flow.get("field")), "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    try:
+        save = await mint_flow_token(
+            review_ref, "correct_save", sender)
+        back = await mint_flow_token(
+            review_ref, "correct_back", sender)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError):
+        await _send_best_effort(summary, chat_id,
+            "Sorry, that step did not work. Try again from the "
+            "latest review message.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": "TelegramLinkError"}
+    preview = _preview_correction_text(kind, staged.get("field"),
+        staged.get("old_value"), staged.get("unit"), value)
+    await _send_best_effort(summary, chat_id, preview, "help_sent",
+        reply_markup={"inline_keyboard": [
+            [{"text": "Save and approve",
+                "callback_data": save["token"]}],
+            [{"text": "Go back", "callback_data": back["token"]}]]})
+    await _set_inbox_status(client, inbox_id, "processed")
+    return {"outcome": "flow_preview"}
+
+
+async def _answer_reject_reason(client, inbox_id, sender, chat_id,
+        review_ref, text, summary):
+    """Runs a guided rejection the moment the reason arrives."""
+    reason = (text or "").strip()
+    if not reason or len(reason) > 2000:
+        await _send_best_effort(summary, chat_id,
+            "Please send a short reason for rejecting.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        return {"outcome": "flow_reason_invalid"}
+    try:
+        await stage_flow(sender, review_ref=review_ref,
+            value_text=reason)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError):
+        pass
+    try:
+        await review_service.reject_from_chat(
+            client, review_ref, PROVIDER, sender,
+            "tgflowrej:" + inbox_id, reason=reason)
+        summary["reviews_rejected"] += 1
+    except TERMINAL_REVIEW_ERRORS as error:
+        await _send_best_effort(summary, chat_id,
+            "Sorry, that report could not be rejected.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    except human_confirmation.WorkflowDatabaseError as error:
+        await _set_inbox_status(client, inbox_id, "failed",
+            _failure_note(error))
+        summary["failed"] += 1
+        return {"outcome": "failed", "error": type(error).__name__}
+    try:
+        await stage_flow(sender, review_ref=review_ref, clear=True)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError):
+        pass
+    await _send_best_effort(summary, chat_id, "Rejected.", "help_sent")
+    await _auto_dispatch_best_effort(summary)
+    await _set_inbox_status(client, inbox_id, "processed")
+    return {"outcome": "reject"}
 
 
 async def _process_cancel(client, inbox_id, sender, chat_id, command,
@@ -981,6 +1353,305 @@ async def _process_cancel(client, inbox_id, sender, chat_id, command,
     return {"outcome": "cancelled", "result": result}
 
 
+async def _auto_dispatch_best_effort(summary):
+    """Delivers due reporter acknowledgements without ever failing the
+    decision that queued them."""
+    try:
+        auto = await dispatch_queued(limit=20)
+        summary["notifications_sent"] += auto.get("sent", 0)
+        summary["notifications_failed"] += auto.get("failed", 0)
+    except Exception:
+        pass
+
+
+def _correct_fields_for_kind(kind):
+    return CORRECTABLE_FIELDS.get(kind or "", ())
+
+
+def _field_label(field):
+    return FIELD_LABELS.get(field, str(field).replace("_", " ").title())
+
+
+async def _send_flow_menu(summary, chat_id, sender, review_ref, kind):
+    """Shows the guided-correction field menu with fresh bound tokens."""
+    fields = _correct_fields_for_kind(kind)
+    if not fields:
+        await _send_best_effort(summary, chat_id,
+            "This report cannot be corrected here. "
+            "Use Approve or Reject.", "help_sent")
+        return
+    buttons = []
+    for field in fields:
+        try:
+            minted = await mint_flow_token(
+                review_ref, "correct_field", sender, field=field)
+        except (TelegramLinkError,
+                human_confirmation.WorkflowDatabaseError,
+                human_confirmation.WorkflowError):
+            return
+        buttons.append([{"text": _field_label(field),
+            "callback_data": minted["token"]}])
+    try:
+        cancel = await mint_flow_token(
+            review_ref, "correct_cancel", sender)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError):
+        return
+    buttons.append([{"text": "Cancel",
+        "callback_data": cancel["token"]}])
+    await _send_best_effort(summary, chat_id, "What is wrong?",
+        "help_sent",
+        reply_markup={"inline_keyboard": buttons})
+
+
+async def _begin_reject_flow(client, inbox_id, sender, chat_id, review_ref,
+        summary):
+    """Starts the guided rejection: stages the flow and asks for a
+    short reason. The tap itself rejects nothing."""
+    try:
+        await stage_flow(sender, review_ref=review_ref, flow="reject")
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError) as error:
+        if isinstance(error, human_confirmation.WorkflowDatabaseError):
+            await _set_inbox_status(client, inbox_id, "failed",
+                _failure_note(error))
+            summary["failed"] += 1
+            return {"outcome": "failed",
+                "error": type(error).__name__}
+        await _send_best_effort(summary, chat_id,
+            "Sorry, that report cannot be rejected right now.",
+            "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    await _send_best_effort(summary, chat_id,
+        "Reply with a short reason for rejecting.", "help_sent")
+    await _set_inbox_status(client, inbox_id, "processed")
+    return {"outcome": "reject_reason_requested"}
+
+
+def _preview_correction_text(kind, field, old_value, unit, new_value):
+    """'Change 50 bags to 1 bag?' in plain words, generic fallback."""
+    label = _field_label(field)
+    if kind == "sale" and field == "quantity" and unit:
+        old = (old_value or "?").strip()
+        return "Change %s %s to %s %s?" % (
+            old, telegram_intake._plural_unit(old, unit),
+            new_value.strip(),
+            telegram_intake._plural_unit(new_value, unit))
+    if field in ("unit_price", "amount_kobo"):
+        old_naira = _naira_of(old_value)
+        new_naira = _naira_of(new_value)
+        if old_naira is not None and new_naira is not None:
+            return "Change %s to %s?" % (old_naira, new_naira)
+    return "Change %s from %s to %s?" % (
+        label.lower(), (old_value or "?").strip(), new_value.strip())
+
+
+def _naira_of(text):
+    try:
+        return telegram_intake._format_naira_simple(float(str(text)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_flow_value(kind, field, text):
+    """Normalizes one guided value, or returns None to re-ask."""
+    clean = (text or "").strip()
+    if not clean or len(clean) > FLOW_VALUE_LIMIT:
+        return None
+    if field in ("quantity", "good_quantity", "rejected_quantity",
+            "normal_quantity", "cold_quantity"):
+        match = re.match(r"^\s*(\d+)\b", clean)
+        if not match or int(match.group(1)) <= 0:
+            return None
+        return str(int(match.group(1)))
+    if field in ("unit_price", "amount_kobo"):
+        match = re.match(r"^\s*(\d+(?:\.\d+)?)\b", clean)
+        if not match or float(match.group(1)) <= 0:
+            return None
+        return match.group(1)
+    if field in ("method", "payment_method"):
+        lowered = clean.lower()
+        if lowered in ("cash", "transfer", "pos"):
+            return lowered
+        if lowered == "bank transfer":
+            return "transfer"
+        return None
+    return clean
+
+
+async def _process_flow_press(client, inbox_id, sender, chat_id,
+        message_id, flowed, summary):
+    """Runs one consumed guided-flow button press to its next step."""
+    status = flowed.get("status")
+    flow = flowed.get("flow")
+    review_ref = flowed.get("review_ref")
+    if status in ("case_closed", "expired"):
+        await _send_best_effort(summary, chat_id,
+            "That report is already decided.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed")
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": status}
+    try:
+        if flow == "correct_menu":
+            await _send_flow_menu(summary, chat_id, sender, review_ref,
+                flowed.get("submission_kind"))
+        elif flow == "correct_field":
+            await stage_flow(sender, review_ref=review_ref,
+                flow="correct", field=flowed.get("field"))
+            await _send_best_effort(summary, chat_id,
+                _ask_for_value(flowed.get("submission_kind"),
+                    flowed.get("field")),
+                "help_sent")
+        elif flow == "correct_save":
+            return await _save_guided_correction(
+                client, inbox_id, sender, chat_id, review_ref, summary)
+        elif flow == "correct_back":
+            try:
+                await stage_flow(sender, review_ref=review_ref, clear=True)
+            except (TelegramLinkError,
+                    human_confirmation.WorkflowDatabaseError,
+                    human_confirmation.WorkflowError):
+                pass
+            await _send_flow_menu(summary, chat_id, sender, review_ref,
+                flowed.get("submission_kind"))
+        elif flow == "correct_cancel":
+            yes = await mint_flow_token(
+                review_ref, "correct_cancel_yes", sender)
+            back = await mint_flow_token(
+                review_ref, "correct_back", sender)
+            await _send_best_effort(summary, chat_id, "Stop correcting?",
+                "help_sent",
+                reply_markup={"inline_keyboard": [
+                    [{"text": "Yes, stop",
+                        "callback_data": yes["token"]}],
+                    [{"text": "Back",
+                        "callback_data": back["token"]}]]})
+        elif flow == "correct_cancel_yes":
+            try:
+                await stage_flow(sender, review_ref=review_ref, clear=True)
+            except (TelegramLinkError,
+                    human_confirmation.WorkflowDatabaseError,
+                    human_confirmation.WorkflowError):
+                pass
+            await _send_best_effort(summary, chat_id,
+                "Correction cancelled.", "help_sent")
+        elif flow == "reject_menu":
+            return await _begin_reject_flow(
+                client, inbox_id, sender, chat_id, review_ref, summary)
+        elif flow == "report_branch":
+            business_id = flowed.get("business_id")
+            branch_id = flowed.get("branch_id")
+            await stage_flow(sender, flow="report_branch",
+                field=flowed.get("field"), business_id=business_id,
+                branch_id=branch_id)
+            label = (branch_id or "branch").replace("_", " ").title()
+            await _send_best_effort(summary, chat_id,
+                "%s saved. Now send your report." % label, "help_sent")
+        else:
+            raise TelegramCallbackError("Flow step is not known")
+    except (TelegramLinkError, TelegramCallbackError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError) as error:
+        if isinstance(error, human_confirmation.WorkflowDatabaseError):
+            await _set_inbox_status(client, inbox_id, "failed",
+                _failure_note(error))
+            summary["failed"] += 1
+            return {"outcome": "failed",
+                "error": type(error).__name__}
+        await _send_best_effort(summary, chat_id,
+            "Sorry, that step did not work. Try again from the "
+            "latest review message.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    await _set_inbox_status(client, inbox_id, "processed")
+    return {"outcome": "flow_%s" % flow}
+
+
+def _ask_for_value(kind, field):
+    label = _field_label(field)
+    if field in ("quantity", "good_quantity", "rejected_quantity",
+            "normal_quantity", "cold_quantity"):
+        return "Send the right number%s." % (
+            " of bags" if field in (
+                "quantity", "good_quantity",
+                "rejected_quantity") else "")
+    if field in ("unit_price", "amount_kobo"):
+        return "Send the right price in naira."
+    if field in ("method", "payment_method"):
+        return "Reply cash, transfer or pos."
+    return "Send the right %s." % label.lower()
+
+
+async def _save_guided_correction(client, inbox_id, sender, chat_id,
+        review_ref, summary):
+    """Applies the staged correction through the confirm RPC (whose
+    request key makes double taps idempotent), then clears the flow."""
+    try:
+        staged = await stage_flow(sender, review_ref=review_ref)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError) as error:
+        if isinstance(error, human_confirmation.WorkflowDatabaseError):
+            await _set_inbox_status(client, inbox_id, "failed",
+                _failure_note(error))
+            summary["failed"] += 1
+            return {"outcome": "failed",
+                "error": type(error).__name__}
+        await _send_best_effort(summary, chat_id,
+            "There is nothing staged to save.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    field = staged.get("field")
+    value = staged.get("value_text")
+    if staged.get("flow") != "correct" or not field or not value:
+        await _send_best_effort(summary, chat_id,
+            "There is nothing staged to save.", "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            "TelegramCallbackError: refused")
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": "TelegramCallbackError"}
+    save_key = "tgflowsave:%s" % inbox_id
+    try:
+        await review_service.confirm_from_chat(
+            client, review_ref, PROVIDER, sender, save_key,
+            correction_reason=GUIDED_CORRECTION_REASON,
+            corrections={field: value})
+        summary["reviews_confirmed"] += 1
+    except TERMINAL_REVIEW_ERRORS as error:
+        await _send_best_effort(summary, chat_id,
+            "Sorry, that correction did not work. Send the right "
+            "%s again." % _field_label(field).lower(), "help_sent")
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(error).__name__}
+    except human_confirmation.WorkflowDatabaseError as error:
+        await _set_inbox_status(client, inbox_id, "failed",
+            _failure_note(error))
+        summary["failed"] += 1
+        return {"outcome": "failed", "error": type(error).__name__}
+    try:
+        await stage_flow(sender, review_ref=review_ref, clear=True)
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError):
+        pass
+    await _send_best_effort(summary, chat_id, "Saved and approved \u2705",
+        "help_sent")
+    await _auto_dispatch_best_effort(summary)
+    await _set_inbox_status(client, inbox_id, "processed")
+    return {"outcome": "confirm"}
+
+
 async def _process_callback(client, inbox_id, callback_query, summary):
     try:
         query_id, sender, chat_id, message_id, token = callback_parts(
@@ -990,6 +1661,43 @@ async def _process_callback(client, inbox_id, callback_query, summary):
             _failure_note(error))
         summary["reviews_refused"] += 1
         return {"outcome": "refused", "error": type(error).__name__}
+    # Guided-flow buttons first; unknown flow tokens fall through to
+    # the one-tap approve/reject path below.
+    try:
+        flowed = await consume_flow_token(token, sender)
+    except TelegramCallbackError as flow_error:
+        if "flow button is not known" not in str(flow_error):
+            await outbound_telegram.answer_callback_query(
+                query_id, "That button did not work.")
+            summary["callbacks_answered"] += 1
+            await _set_inbox_status(client, inbox_id, "processed",
+                _failure_note(flow_error))
+            summary["reviews_refused"] += 1
+            return {"outcome": "refused",
+                "error": type(flow_error).__name__}
+        flowed = None
+    except (TelegramLinkError,
+            human_confirmation.WorkflowDatabaseError,
+            human_confirmation.WorkflowError) as flow_error:
+        await outbound_telegram.answer_callback_query(
+            query_id, "That button did not work.")
+        summary["callbacks_answered"] += 1
+        if isinstance(flow_error, human_confirmation.WorkflowDatabaseError):
+            await _set_inbox_status(client, inbox_id, "failed",
+                _failure_note(flow_error))
+            summary["failed"] += 1
+            return {"outcome": "failed",
+                "error": type(flow_error).__name__}
+        await _set_inbox_status(client, inbox_id, "processed",
+            _failure_note(flow_error))
+        summary["reviews_refused"] += 1
+        return {"outcome": "refused", "error": type(flow_error).__name__}
+    if flowed is not None:
+        await outbound_telegram.answer_callback_query(query_id)
+        summary["callbacks_answered"] += 1
+        return await _process_flow_press(
+            client, inbox_id, sender, chat_id, message_id, flowed,
+            summary)
     try:
         consumed = await consume_button_token(token, sender)
     except (TelegramCallbackError,
@@ -1016,21 +1724,15 @@ async def _process_callback(client, inbox_id, callback_query, summary):
     if status in ("case_closed", "expired"):
         await outbound_telegram.clear_inline_keyboard(chat_id, message_id)
         await _send_best_effort(summary, chat_id,
-            "That request for %s is already decided or expired; no action "
-            "was taken." % review_ref, "help_sent")
+            "That report is already decided.", "help_sent")
         await _set_inbox_status(client, inbox_id, "processed")
         summary["reviews_refused"] += 1
         return {"outcome": "refused", "error": status}
     if consumed.get("action") == "reject":
-        # Rejections require an explicit reason, so a tap can never
-        # reject by itself: the reviewer completes the strict text
-        # command carrying the server-issued reference and key.
-        await outbound_telegram.clear_inline_keyboard(chat_id, message_id)
-        await _send_best_effort(summary, chat_id,
-            REJECT_INSTRUCTIONS.format(ref=review_ref, key=request_key),
-            "help_sent")
-        await _set_inbox_status(client, inbox_id, "processed")
-        return {"outcome": "reject_instructions"}
+        # A tap can never reject by itself: start the guided reason
+        # flow instead of exposing command syntax and keys.
+        return await _begin_reject_flow(
+            client, inbox_id, sender, chat_id, review_ref, summary)
     try:
         await review_service.confirm_from_chat(
             client, review_ref, PROVIDER, sender, request_key)
@@ -1041,8 +1743,7 @@ async def _process_callback(client, inbox_id, callback_query, summary):
             _failure_note(error))
         summary["reviews_refused"] += 1
         await _send_best_effort(summary, chat_id,
-            "Refused (%s) for %s." % (type(error).__name__, review_ref),
-            "help_sent")
+            "Sorry, that could not be approved.", "help_sent")
         return {"outcome": "refused", "error": type(error).__name__}
     except human_confirmation.WorkflowDatabaseError as error:
         await _set_inbox_status(client, inbox_id, "failed",
@@ -1050,8 +1751,9 @@ async def _process_callback(client, inbox_id, callback_query, summary):
         summary["failed"] += 1
         return {"outcome": "failed", "error": type(error).__name__}
     await outbound_telegram.clear_inline_keyboard(chat_id, message_id)
-    await _send_best_effort(summary, chat_id,
-        "Recorded confirm for %s." % review_ref, "help_sent")
+    await _send_best_effort(summary, chat_id, "Approved \u2705",
+        "help_sent")
+    await _auto_dispatch_best_effort(summary)
     await _set_inbox_status(client, inbox_id, "processed")
     return {"outcome": outcome}
 
@@ -1123,23 +1825,52 @@ def _parse_outbound_ref(idempotency_key):
     return ref
 
 
-async def dispatch_queued(limit=20, review_ref=None):
-    """Claims queued Telegram review_request rows (exactly once via a
-    conditional claim) and sends each with fresh one-tap buttons. Minting
-    replaces superseded buttons transactionally, so retries never stack
-    live tokens. Returns a summary; never raises for a single-row
-    failure."""
-    summary = {"scanned": 0, "sent": 0, "failed": 0, "claim_conflicts": 0}
+def _outbound_due(row):
+    """A row with a future next_attempt_at waits; anything else is due."""
+    raw = row.get("next_attempt_at")
+    if not raw:
+        return True
+    try:
+        moment = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment <= datetime.now(timezone.utc)
+
+
+def _parse_outbound_ack(idempotency_key):
+    """Accepts only review_ack:<tenant>:<request-key> reporter acks."""
+    if not isinstance(idempotency_key, str):
+        return None
+    parts = idempotency_key.split(":")
+    if len(parts) < 3 or parts[0] != "review_ack" or not parts[1]:
+        return None
+    return parts[1]
+
+
+async def dispatch_queued(limit=20, review_ref=None, message_types=None):
+    """Claims queued Telegram rows (exactly once via a conditional claim)
+    and sends review requests with fresh one-tap buttons plus reporter
+    acknowledgements as plain text. Minting replaces superseded buttons
+    transactionally, so retries never stack live tokens. Delivery
+    failures requeue with backoff and stay retryable; only terminal
+    validation errors fail a row. Returns a summary; never raises for a
+    single-row failure."""
+    summary = {"scanned": 0, "sent": 0, "failed": 0, "claim_conflicts": 0,
+        "deferred": 0, "retried": 0}
+    types = message_types or DISPATCHABLE_TYPES
     url, headers = _client_headers()
     try:
         async with httpx.AsyncClient(base_url=url, headers=headers,
                 timeout=8, follow_redirects=False) as client:
             params = {"provider": "eq." + PROVIDER,
                 "status": "eq.queued",
-                "message_type": "eq.review_request",
+                "message_type": "in.(%s)" % ",".join(types),
                 "order": "queued_at.asc", "limit": str(limit),
                 "select": "id,tenant_id,provider_sender,recipient_employee_id,"
-                    "message_text,idempotency_key"}
+                    "message_type,message_text,idempotency_key,"
+                    "attempt_count,next_attempt_at"}
             if review_ref is not None:
                 params["idempotency_key"] = "like.*:%s:*" % review_ref
             response = await client.get("/rest/v1/biz_outbound_messages",
@@ -1150,6 +1881,9 @@ async def dispatch_queued(limit=20, review_ref=None):
             rows = response.json()
             for row in rows:
                 summary["scanned"] += 1
+                if not _outbound_due(row):
+                    summary["deferred"] += 1
+                    continue
                 claimed = await client.patch(
                     "/rest/v1/biz_outbound_messages",
                     params={"id": "eq." + row["id"],
@@ -1166,6 +1900,8 @@ async def dispatch_queued(limit=20, review_ref=None):
                 outcome = await _send_claimed(client, claimed_rows[0])
                 if outcome == "sent":
                     summary["sent"] += 1
+                elif outcome == "retried":
+                    summary["retried"] += 1
                 else:
                     summary["failed"] += 1
     except (DatabaseUnavailable, human_confirmation.WorkflowDatabaseError,
@@ -1174,36 +1910,75 @@ async def dispatch_queued(limit=20, review_ref=None):
     return summary
 
 
+async def _requeue_for_retry(client, row, error):
+    """Returns True when the row stays retryable (requeued with backoff),
+    False when attempts are spent and the row fails terminally."""
+    try:
+        attempts = int(row.get("attempt_count") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    attempts += 1
+    if attempts >= TG_DISPATCH_MAX_ATTEMPTS:
+        await _mark_outbound(client, row["id"], "failed",
+            {"attempt_count": attempts,
+                "failure_reason": _failure_note(error)})
+        return False
+    retry_at = datetime.now(timezone.utc) + timedelta(
+        minutes=_retry_delay_minutes(attempts))
+    await _mark_outbound(client, row["id"], "queued",
+        {"attempt_count": attempts,
+            "next_attempt_at": retry_at.isoformat(),
+            "failure_reason": _failure_note(error)})
+    return True
+
+
 async def _send_claimed(client, row):
-    ref = _parse_outbound_ref(row.get("idempotency_key"))
+    message_type = row.get("message_type")
     chat_id = row.get("provider_sender")
     try:
-        if ref is None or not isinstance(chat_id, str) or not chat_id:
+        if not isinstance(chat_id, str) or not chat_id:
             raise TelegramAdapterError("Outbound row is not routable")
-        approve = await mint_button_token(ref, "approve", chat_id)
-        try:
-            reject = await mint_button_token(ref, "reject", chat_id)
-        except (TelegramCallbackError,
-                human_confirmation.WorkflowError):
-            reject = None
-        if reject is None:
-            keyboard = {"inline_keyboard": [
-                [{"text": "Approve",
-                    "callback_data": approve["token"]}]]}
-        else:
-            keyboard = review_keyboard(
-                approve["token"], reject["token"])
         body = row.get("message_text") or ""
-        body += "\n\nTap Approve for one-tap confirmation, or reply with " \
-            "a REVIEW command carrying the reference above."
+        if message_type == "review_request":
+            ref = _parse_outbound_ref(row.get("idempotency_key"))
+            if ref is None:
+                raise TelegramAdapterError("Outbound row is not routable")
+            approve = await mint_button_token(ref, "approve", chat_id)
+            try:
+                reject = await mint_button_token(ref, "reject", chat_id)
+            except (TelegramCallbackError,
+                    human_confirmation.WorkflowError):
+                reject = None
+            try:
+                correct = await mint_flow_token(
+                    ref, "correct_menu", chat_id)
+            except (TelegramCallbackError, TelegramLinkError,
+                    human_confirmation.WorkflowError):
+                correct = None
+            if reject is None:
+                keyboard = {"inline_keyboard": [
+                    [{"text": "Approve",
+                        "callback_data": approve["token"]}]]}
+            else:
+                keyboard = review_keyboard(
+                    approve["token"], reject["token"],
+                    correct["token"] if correct else None)
+            body += "\n\nTap a button below."
+        elif message_type in ("review_confirmed", "review_rejected",
+                "review_cancelled"):
+            if _parse_outbound_ack(row.get("idempotency_key")) is None:
+                raise TelegramAdapterError("Outbound row is not routable")
+            keyboard = None
+        else:
+            raise TelegramAdapterError("Outbound row is not routable")
         if len(body) > 4000:
             body = body[:4000]
         try:
             sent = await outbound_telegram.send_message(
                 chat_id, body, reply_markup=keyboard)
         except outbound_telegram.OutboundUnavailable as error:
-            await _mark_outbound(client, row["id"], "failed",
-                {"failure_reason": _failure_note(error)})
+            if await _requeue_for_retry(client, row, error):
+                return "retried"
             return "failed"
         await _mark_outbound(client, row["id"], "sent",
             {"sent_at": datetime.now(timezone.utc).isoformat(),
@@ -1220,11 +1995,13 @@ async def _send_claimed(client, row):
 
 
 async def sync_submission_reviews(submission_id, request_key):
-    """Operator/scheduler entry point: queues Telegram review requests
-    for one draft submission, then dispatches its queued notifications.
-    Best-effort per stage; the draft and the WhatsApp flow are never
-    affected by a Telegram failure."""
-    summary = {"queue_status": None, "dispatch": None, "error": None}
+    """Operator/scheduler recovery entry point: queues Telegram review
+    requests for one draft submission, dispatches its queued
+    notifications, then sweeps any other due Telegram rows (for example
+    reporter acknowledgements). Best-effort per stage; the draft and the
+    WhatsApp flow are never affected by a Telegram failure."""
+    summary = {"queue_status": None, "dispatch": None, "sweep": None,
+        "error": None}
     try:
         queued = await queue_telegram_reviews(submission_id, request_key)
     except (TelegramAdapterError,
@@ -1235,4 +2012,5 @@ async def sync_submission_reviews(submission_id, request_key):
     if queued.get("status") in ("queued", "already_queued"):
         summary["dispatch"] = await dispatch_queued(
             review_ref=queued.get("review_ref"))
+        summary["sweep"] = await dispatch_queued(limit=20)
     return summary
